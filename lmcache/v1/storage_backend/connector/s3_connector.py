@@ -413,10 +413,10 @@ class S3Connector(RemoteConnector):
 
         _end = time.perf_counter_ns()
         _duration_ms = (_end - _start)
-        logger.info("%s TCP GET completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
 
         dst_ptr = memory_obj.data_ptr
         ctypes.memmove(dst_ptr, shm, obj_size)
+        logger.info("%s TCP GET completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
 
         self.adhoc_shm_manager.free(recv_path, shm)
 
