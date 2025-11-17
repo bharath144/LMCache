@@ -3,13 +3,16 @@
 
 # Standard
 from typing import Dict, List, Optional
+from functools import partial
 
 # Standard library imports
 import asyncio
 import ctypes
-import ctypes.util
 import os
 import time
+from enum import IntEnum, auto
+from itertools import cycle
+from threading import Lock
 
 # Third Party
 import torch
@@ -82,24 +85,18 @@ except ImportError as e:
             f"\n\nOriginal error: {e}"
         )
 
-# # boto3 import
-# try:
-#     # Third Party
-#     import boto3
-#     _BOTO3_AVAILABLE = True
-# except ImportError:
-#     _BOTO3_AVAILABLE = False
-
-# First Party
 # First Party imports
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.storage_backend.connector.base_connector import RemoteConnector
-from lmcache.v1.storage_backend.connector.s3_rdma_adapter import S3RdmaConnectorSettings
-from lmcache.v1.storage_backend.job_executor.pq_executor import (
-    AsyncPQThreadPoolExecutor,
+from lmcache.v1.storage_backend.connector.s3_rdma_adapter import (
+    S3RdmaConnectorSettings
 )
+# from lmcache.v1.storage_backend.job_executor.pq_executor import (
+#     AsyncPQThreadPoolExecutor,
+# )
+from lmcache.v1.storage_backend.job_executor.pq_executor import AsyncPQExecutor
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 logger = init_logger(__name__)
@@ -107,6 +104,18 @@ logger = init_logger(__name__)
 # Unique prefix for easy log filtering
 LOG_PREFIX = "[S3-RDMA]"
 
+# class Priorities(IntEnum):
+#     GET = auto()       # 1 - Cache retrieval (highest priority)
+#     PEEK = auto()      # 2 - Existence checks
+#     PREFETCH = auto()  # 3 - Background prefetching
+#     PUT = auto()       # 4 - Cache storage (lowest priority)
+
+class Priorities(IntEnum):
+    GET = auto()       # 1 - Cache retrieval (highest priority)
+    PUT = auto()       # 2 - Cache storage (2nd highest priority)
+    PEEK = auto()      # 3 - Existence checks
+    PREFETCH = auto()  # 4 - Background prefetching (lowest priority)
+   
 
 class S3RdmaConnector(RemoteConnector):
     """
@@ -125,7 +134,6 @@ class S3RdmaConnector(RemoteConnector):
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
     ) -> None:
-        logger.debug("%s __init__ ENTER", LOG_PREFIX)
         if not _HPE_OBJECT_AVAILABLE:
             error_msg = (
                 f"hpe_object package is required for S3 RDMA connector.\n"
@@ -134,40 +142,40 @@ class S3RdmaConnector(RemoteConnector):
             logger.error(error_msg)
             raise ImportError(error_msg)
 
-        # if not _BOTO3_AVAILABLE:
-        #     raise ImportError(
-        #         "boto3 is required for S3 RDMA connector. "
-        #         "Install with: pip install boto3"
-        #     )
-
         if not _cufile_loaded:
             logger.warning(
                 "Could not pre-load HPE cuFile library. "
-                "Ensure you're using the fixed launcher script with correct LD_LIBRARY_PATH"
+                "Ensure you're using the fixed launcher script with correct "
+                "LD_LIBRARY_PATH."
             )
 
         self.settings = settings
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
-        self._client: Optional[S3RdmaClient] = None
+        #self._client: Optional[S3RdmaClient] = None
         # self._client_lock = threading.Lock()
+        self._client_pool: List[S3RdmaClient] = []
+        self._client_pool_size: int = 16 # Number of clients in the pool
+        self._client_iterator: Optional[cycle] = None
+        self._client_lock = Lock()
+        
         self._boto_client = None
         self._object_size_cache: Dict[str, int] = {}
         self._inflight_sema: Optional[asyncio.Semaphore] = None
-        self._io_executor: Optional[AsyncPQThreadPoolExecutor] = None
+        # self._io_executor: Optional[AsyncPQThreadPoolExecutor] = None
+        self.pq_executor: Optional[AsyncPQExecutor] = None
 
         self._prefixed_bucket_path = settings.prefix
         self._effective_parallelism = max(1, settings.max_parallel_requests)
-        logger.debug("%s __init__ EXIT", LOG_PREFIX)
 
     def post_init(self) -> None:
         """Initialize clients after event loop is set up."""
-        logger.debug("%s post_init ENTER", LOG_PREFIX)
         super().post_init()
 
         logger.info(
-            "Initializing S3 RDMA client (endpoint=%s, bucket=%s, prefix=%s, parallelism=%d)",
+            "Initializing S3 RDMA client (endpoint=%s, bucket=%s, prefix=%s,"
+            "parallelism=%d)",
             self.settings.endpoint,
             self.settings.bucket,
             self._prefixed_bucket_path or "(none)",
@@ -183,83 +191,85 @@ class S3RdmaConnector(RemoteConnector):
             logger.info("Using max segment size: %s bytes", self.settings.max_segment_size)
             client_config.max_segment_size = self.settings.max_segment_size
 
-        self._client = S3RdmaClient(client_config)
-        logger.info("S3 RDMA client initialized")
+        #self._client = S3RdmaClient(client_config)
+        #logger.info("S3 RDMA client initialized")
+        
+        # Create pool of S3RdmaClient instances
+        for i in range(self._client_pool_size):
+            client = S3RdmaClient(client_config)
+            self._client_pool.append(client)
+            logger.debug("%s Created S3 RDMA client %d/%d", LOG_PREFIX, i + 1, self._client_pool_size)
 
-        # boto_kwargs = {"endpoint_url": self.settings.endpoint}
-        # if self.settings.region:
-        #     boto_kwargs["region_name"] = self.settings.region
-
-        # if self.settings.boto_profile:
-        #     session = boto3.Session(profile_name=self.settings.boto_profile)
-        #     self._boto_client = session.client("s3", **boto_kwargs)
-        # else:
-        #     self._boto_client = boto3.client("s3", **boto_kwargs)
-
-        # logger.info("boto3 client initialized")
+        # Create round-robin iterator
+        self._client_iterator = cycle(self._client_pool)
+        
+        logger.info("%s S3 RDMA client pool initialized with %d clients", LOG_PREFIX, self._client_pool_size)
 
         self._inflight_sema = asyncio.Semaphore(self._effective_parallelism)
-        self._io_executor = AsyncPQThreadPoolExecutor(
-            self.loop, max_workers=self._effective_parallelism
-        )
+        # self._io_executor = AsyncPQThreadPoolExecutor(
+        #     self.loop, max_workers=self._effective_parallelism
+        # )
+        self.pq_executor = AsyncPQExecutor(self.loop)
         logger.info("S3 RDMA connector initialization complete")
-        logger.debug("%s post_init EXIT", LOG_PREFIX)
+    
+    # Pick the next S3RdmaClient from the pool
+    def _get_next_client(self) -> S3RdmaClient:
+        """Get next client from pool using round-robin scheduling."""
+        with self._client_lock:
+            return next(self._client_iterator)
 
     def _make_s3_key(self, key: CacheEngineKey) -> str:
         """Convert CacheEngineKey to S3 object key with optional prefix."""
-        # logger.debug("%s _make_s3_key ENTER: key=%s", LOG_PREFIX, key)
         key_str = key.to_string()
         if self._prefixed_bucket_path:
             result = f"{self._prefixed_bucket_path}/{key_str}"
         else:
             result = key_str
-        # logger.debug("%s _make_s3_key EXIT: result=%s", LOG_PREFIX, result)
         return result
 
     def _get_object_size_sync(self, s3_key: str) -> Optional[int]:
         """Get object size using S3 HEAD request (synchronous)."""
-        # logger.debug("%s _get_object_size_sync ENTER: s3_key=%s", LOG_PREFIX, s3_key)
         if s3_key in self._object_size_cache:
-            cached_size = self._object_size_cache[s3_key]
-            # logger.debug("%s _get_object_size_sync EXIT (cached): size=%s", LOG_PREFIX, cached_size)
-            return cached_size
+            return self._object_size_cache[s3_key]
 
         try:
-            size = self._client.get_object_size(
+            _client = self._get_next_client()
+            size = _client.get_object_size(
                 bucket=self.settings.bucket,
                 key=s3_key
             )
             self._object_size_cache[s3_key] = size
-            # logger.debug("%s _get_object_size_sync EXIT: size=%s", LOG_PREFIX, size)
             return size
         except Exception as e:
             logger.debug("Failed to get size for %s: %s", s3_key, e)
-            # logger.debug("%s _get_object_size_sync EXIT: error", LOG_PREFIX)
             return None
 
     async def exists(self, key: CacheEngineKey) -> bool:
         """Check if key exists in S3."""
-        # logger.debug("%s exists ENTER: key=%s", LOG_PREFIX, key)
+        return await self.pq_executor.submit_job(
+            self._exists,
+            key=key,
+            priority=Priorities.PEEK,
+        )
+
+    async def _exists(self, key: CacheEngineKey) -> bool:
+        """Internal exists implementation."""
         s3_key = self._make_s3_key(key)
-        size = await self.loop.run_in_executor(None, self._get_object_size_sync, s3_key)
-        result = size is not None
-        # logger.debug("%s exists EXIT: result=%s", LOG_PREFIX, result)
-        return result
+        # Use run_in_executor since HPE client is sync
+        size = await self.loop.run_in_executor(
+            None, self._get_object_size_sync, s3_key
+        )
+        return size is not None
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
         """Synchronous version of exists."""
-        # logger.debug("%s exists_sync ENTER: key=%s", LOG_PREFIX, key)
         s3_key = self._make_s3_key(key)
         result = self._get_object_size_sync(s3_key) is not None
-        # logger.debug("%s exists_sync EXIT: result=%s", LOG_PREFIX, result)
         return result
 
     def _get_object_sync(self, s3_key: str, memory_obj: MemoryObj) -> bool:
         """Synchronous RDMA GET operation."""
-        # logger.debug("%s _get_object_sync ENTER: s3_key=%s", LOG_PREFIX, s3_key)
-
         try:
-            # logger.debug("%s Begin RDMA GET to GPU memory: %s", LOG_PREFIX, s3_key)
             # Get the underlying storage
             storage = memory_obj.tensor.untyped_storage()
 
@@ -271,18 +281,11 @@ class S3RdmaConnector(RemoteConnector):
             # Create buffer from the storage using ctypes
             buffer = (ctypes.c_ubyte * storage_size).from_address(storage_ptr)
 
-            # logger.debug("RDMA GET: bucket=%s, key=%s, size=%s", self.settings.bucket, s3_key, storage_size)
+            _client = self._get_next_client()
+            assert _client is not None
 
-            # with self._client_lock:
-            #     self._client.get_object_buffers(
-            #         BufferGetObject(
-            #             bucket=self.settings.bucket,
-            #             key=s3_key,
-            #             buffer=memoryview(buffer)
-            #             )
-            #     )
             _start = time.perf_counter_ns()
-            self._client.get_object_buffers(
+            _client.get_object_buffers(
                 BufferGetObject(
                     bucket=self.settings.bucket,
                     key=s3_key,
@@ -293,17 +296,6 @@ class S3RdmaConnector(RemoteConnector):
             _duration_ms = (_end - _start)
             logger.info("%s RDMA GET completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, s3_key, storage_size)
 
-            # logger.debug("%s End RDMA GET to GPU memory: %s", LOG_PREFIX, s3_key)
-            # logger.debug("%s RDMA transfer complete - data is in GPU memory", LOG_PREFIX)
-
-            # The data is now in the GPU tensor's storage
-            # The RemoteBackend will handle deserialization based on the format
-            # logger.debug(
-            #     "%s MemoryObj ready for deserialization: fmt=%s, size=%s",
-            #     LOG_PREFIX, memory_obj.metadata.fmt, memory_obj.metadata.phy_size
-            # )
-
-            # logger.debug("%s _get_object_sync EXIT: success=True", LOG_PREFIX)
             return True
 
         except RuntimeError as e:
@@ -311,40 +303,42 @@ class S3RdmaConnector(RemoteConnector):
             error_str = str(e).lower()
             if "not found" in error_str or "404" in error_str or "nosuchkey" in error_str:
                 logger.debug("Object not found: %s", s3_key)
-                logger.debug("%s _get_object_sync EXIT: success=False (not found)", LOG_PREFIX)
                 return False
             else:
                 logger.error("RDMA GET error for %s: %s", s3_key, e)
-                logger.debug("%s _get_object_sync EXIT: error (RuntimeError)", LOG_PREFIX)
                 raise
 
         except Exception as e:
             logger.error("Unexpected error during RDMA GET %s: %s", s3_key, e)
-            logger.debug("%s _get_object_sync EXIT: error (Exception)", LOG_PREFIX)
             raise
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Get object from S3 using RDMA."""
+        return await self.pq_executor.submit_job(
+            self._get,
+            key=key,
+            priority=Priorities.GET,
+        )
+
+    async def _get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        """Internal get implementation with semaphore handling."""
         s3_key = self._make_s3_key(key)
-        # logger.debug("%s get ENTER: key=%s", LOG_PREFIX, s3_key)
 
         try:
-            size = await self.loop.run_in_executor(None, self._get_object_size_sync, s3_key)
+            # Size check doesn't need semaphore
+            size = await self.loop.run_in_executor(
+                None, self._get_object_size_sync, s3_key
+            )
             if size is None:
-                # logger.debug("%s get EXIT: result=None (not found): %s", LOG_PREFIX, s3_key)
                 return None
-
-            # logger.debug("%s get: Object size=%s bytes for key=%s", LOG_PREFIX, size, s3_key)
 
             # Allocate GPU memory directly for RDMA transfer
             try:
                 gpu_device = self.local_cpu_backend.dst_device
-                #gpu_device = f"cuda:{torch.cuda.current_device()}"
-                gpu_tensor = torch.empty(size, dtype=torch.uint8, device=gpu_device)
-                # logger.debug(
-                #     "%s get: Allocated GPU tensor on device %s with size %s bytes for key=%s",
-                #     LOG_PREFIX, gpu_device, size, s3_key
-                # )
+                gpu_tensor = torch.empty(
+                    size,
+                    dtype=torch.uint8,
+                    device=gpu_device)
 
                 # Create metadata for the MemoryObj
                 metadata = MemoryObjMetadata(
@@ -358,113 +352,65 @@ class S3RdmaConnector(RemoteConnector):
                 )
 
                 # Create TensorMemoryObj wrapping the GPU tensor
-                # parent_allocator=None since we're managing this memory directly
                 memory_obj = TensorMemoryObj(
                     raw_data=gpu_tensor,
                     metadata=metadata,
                     parent_allocator=None
                 )
 
-                # logger.debug(
-                #     "%s get: Created TensorMemoryObj (device=%s, size=%s)",
-                #     LOG_PREFIX, gpu_tensor.device, size
-                # )
-
             except Exception as e:
-                logger.error("Failed to allocate GPU memory for %s: %s", s3_key, e)
-                logger.debug("%s get EXIT: result=None (allocation failed)", LOG_PREFIX)
+                logger.error(
+                    "Failed to allocate GPU memory for %s: %s", s3_key, e)
                 return None
 
             # Verify memory location before RDMA transfer
-            if not (hasattr(memory_obj, 'tensor') and memory_obj.tensor is not None):
-                logger.error("%s memory_obj has no tensor attribute!", LOG_PREFIX)
-                logger.debug("%s get EXIT: result=None (invalid memory_obj)", LOG_PREFIX)
+            if not (hasattr(memory_obj, 'tensor') and \
+                    memory_obj.tensor is not None):
+                logger.error(
+                    "%s memory_obj has no tensor attribute!", LOG_PREFIX)
                 return None
 
             if not memory_obj.tensor.is_cuda:
                 logger.error(
-                    "%s Allocated memory is NOT on GPU! Device: %s. Cannot proceed with RDMA transfer.",
+                    "%s Allocated memory is NOT on GPU! Device: %s. Cannot "
+                    "proceed with RDMA transfer.",
                     LOG_PREFIX, memory_obj.tensor.device
                 )
-                logger.debug("%s get EXIT: result=None (not GPU memory)", LOG_PREFIX)
                 return None
 
-            # logger.debug(
-            #     "%s get: Verified GPU memory allocation (device=%s)",
-            #     LOG_PREFIX, memory_obj.tensor.device
-            # )
-
-            # Log memory_obj attributes before RDMA call
-            # logger.debug("%s get: memory_obj.tensor type=%s", LOG_PREFIX, type(memory_obj.tensor))
-            # logger.debug("%s get: memory_obj.shape=%s", LOG_PREFIX, memory_obj.tensor.shape)
-            # logger.debug("%s get: memory_obj.dtype=%s", LOG_PREFIX, memory_obj.tensor.dtype)
-            # logger.debug("%s get: memory_obj.device=%s", LOG_PREFIX, memory_obj.tensor.device)
-            # logger.debug("%s get: memory_obj.is_cuda=%s", LOG_PREFIX, memory_obj.tensor.is_cuda)
-
+            # Semaphore handling for RDMA operation
+            await self._inflight_sema.acquire()
             try:
-                async with self._inflight_sema:
-                    success = await self.loop.run_in_executor(
-                        None, self._get_object_sync, s3_key, memory_obj
-                    )
+                success = await self.loop.run_in_executor(
+                    None,
+                    self._get_object_sync,
+                    s3_key,
+                    memory_obj)
 
-                # logger.debug("%s get: RDMA completed, success=%s", LOG_PREFIX, success)
-                # logger.debug("%s get: Retrieved MemoryObj: fmt=%s, shape=%s, dtype=%s", LOG_PREFIX, memory_obj.metadata.fmt, memory_obj.metadata.shape, memory_obj.metadata.dtype)
                 if not success:
                     # Clean up on failure
-                    # Since parent_allocator is None, we just delete the object
                     memory_obj.invalidate()
                     del memory_obj
                     del gpu_tensor
-                    # logger.debug("%s get EXIT: result=None (get failed)", LOG_PREFIX)
                     return None
 
-                # Log memory_obj attributes after RDMA call
-                # logger.debug("%s get: After RDMA - tensor.shape=%s", LOG_PREFIX, memory_obj.tensor.shape)
-                # logger.debug("%s get: After RDMA - tensor.device=%s", LOG_PREFIX, memory_obj.tensor.device)
-                # logger.debug("%s get: After RDMA - tensor.is_cuda=%s", LOG_PREFIX, memory_obj.tensor.is_cuda)
-
-                # Add diagnostic info about what will be deserialized
-                # logger.debug(
-                #     "%s get: Returning %s format MemoryObj to RemoteBackend for deserialization (size=%s bytes)",
-                #     LOG_PREFIX, memory_obj.metadata.fmt, memory_obj.metadata.phy_size
-                # )
-
-                # logger.debug("Retrieved %s bytes for %s to GPU memory", size, s3_key)
-                # logger.debug("%s get EXIT: result=MemoryObj (success)", LOG_PREFIX)
                 return memory_obj
-
-            except Exception as e:
-                # Clean up on error
-                memory_obj.invalidate()
-                del memory_obj
-                del gpu_tensor
-                logger.error("Failed to get %s: %s", s3_key, e, exc_info=True)
-                logger.debug("%s get EXIT: error raised", LOG_PREFIX)
-                raise
+            finally:
+                self._inflight_sema.release()
 
         except Exception as e:
-            # Catch any other exceptions from the outer try block
             logger.error("Failed to get %s (outer error): %s", s3_key, e, exc_info=True)
-            logger.debug("%s get EXIT: outer exception raised", LOG_PREFIX)
             raise
 
     def _put_object_sync(self, s3_key: str, memory_obj: MemoryObj) -> None:
         """Synchronous RDMA PUT operation."""
-        # logger.debug("%s _put_object_sync ENTER: s3_key=%s", LOG_PREFIX, s3_key)
         try:
             buffer_view = memory_obj.byte_array
-            # logger.debug("RDMA PUT: bucket=%s, key=%s, size=%s", self.settings.bucket, s3_key, len(buffer_view))
+            _client = self._get_next_client()
+            assert _client is not None
 
-            # with self._client_lock:
-            #     self._client.put_object_buffers(
-            #         BufferPutObject(
-            #             bucket=self.settings.bucket,
-            #             key=s3_key,
-            #             buffer=buffer_view
-            #         )
-            #     )
             _start = time.perf_counter_ns()
-            self._client.put_object_buffers(
+            _client.put_object_buffers(
                 BufferPutObject(
                     bucket=self.settings.bucket,
                     key=s3_key,
@@ -472,88 +418,232 @@ class S3RdmaConnector(RemoteConnector):
                 )
             )
             _end = time.perf_counter_ns()
-            _duration_ms = (_end - _start)
-            logger.info("%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, s3_key, len(buffer_view))
+            _duration_ms = _end - _start
+            logger.info(
+                "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
+                LOG_PREFIX, _duration_ms / 1_000_000,
+                s3_key,
+                len(buffer_view))
 
             # Cache the size
             self._object_size_cache[s3_key] = len(buffer_view)
-            # logger.debug("RDMA PUT completed: %s", s3_key)
-            # logger.debug("%s _put_object_sync EXIT: success", LOG_PREFIX)
 
         except RuntimeError as e:
             logger.error("RDMA PUT error for %s: %s", s3_key, e)
-            logger.debug("%s _put_object_sync EXIT: error (RuntimeError)", LOG_PREFIX)
             raise
         except Exception as e:
             logger.error("Unexpected error during RDMA PUT %s: %s", s3_key, e)
-            logger.debug("%s _put_object_sync EXIT: error (Exception)", LOG_PREFIX)
             raise
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         """Put object to S3 using RDMA."""
-        # logger.debug("%s put ENTER: key=%s", LOG_PREFIX, key)
-        # logger.debug("%s put memory_obj = %s", LOG_PREFIX, vars(memory_obj))
+        return await self.pq_executor.submit_job(
+            self._put,
+            key=key,
+            memory_obj=memory_obj,
+            priority=Priorities.PUT,
+        )
+
+    # Fire and forget version of _put()
+    async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        """Internal put implementation - fire and forget."""
         s3_key = self._make_s3_key(key)
 
-        async with self._inflight_sema:
-            await self.loop.run_in_executor(None, self._put_object_sync, s3_key, memory_obj)
+        # Fire and forget - no await
+        self.loop.run_in_executor(
+            None,
+            self._put_object_sync,
+            s3_key,
+            memory_obj
+        )
 
-        # logger.debug("Stored %s bytes for %s", len(memory_obj.byte_array), key)
-        # logger.debug("%s put EXIT: success", LOG_PREFIX)
+    # Returns immediately without waiting
+    # async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+    #     """Internal put implementation with semaphore handling."""
+    #     s3_key = self._make_s3_key(key)
 
-    # def _list_objects_sync(self) -> List[str]:
-    #     """Synchronous list operation using boto3."""
-    #     logger.debug("%s _list_objects_sync ENTER", LOG_PREFIX)
+    #     await self._inflight_sema.acquire()
     #     try:
-    #         result = []
-    #         continuation_token = None
+    #         await self.loop.run_in_executor(
+    #             None,
+    #             self._put_object_sync,
+    #             s3_key,
+    #             memory_obj
+    #         )
+    #     finally:
+    #         self._inflight_sema.release()
 
-    #         while True:
-    #             kwargs = {'Bucket': self.settings.bucket}
-    #             if self._prefixed_bucket_path:
-    #                 kwargs['Prefix'] = self._prefixed_bucket_path + "/"
-    #             if continuation_token:
-    #                 kwargs['ContinuationToken'] = continuation_token
+    def support_batched_get(self) -> bool:
+        return True
 
-    #             response = self._boto_client.list_objects_v2(**kwargs)
+    def on_get_done(
+        self,
+        s3_key: str,
+        memory_obj: Optional[MemoryObj],
+        _start: int,
+        fut: asyncio.Future,
+    ):
+        """Callback to release semaphore after RDMA GET completes."""
+        try:
+            if fut.exception():
+                logger.error("RDMA GET failed for %s: %s", s3_key, fut.exception())
+                # Clean up the failed memory object
+                if memory_obj is not None:
+                    try:
+                        memory_obj.invalidate()
+                        # Help GC by breaking references
+                        if hasattr(memory_obj, 'raw_data'):
+                            del memory_obj.raw_data
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            "Error during memory cleanup for %s: %s",
+                            s3_key, cleanup_error
+                        )
+            else:
+                _end = time.perf_counter_ns()
+                _duration_ms = (_end - _start)
+                logger.info("%s RDMA (Batched)GET completed in %.6f ms: %s. Transfer size: %s",
+                            LOG_PREFIX, _duration_ms / 1_000_000, 
+                            s3_key, memory_obj.get_physical_size())
+        except Exception as e:
+            logger.error("on_get_done callback error for %s: %s", s3_key, e)
+        finally:
+            self._inflight_sema.release()
 
-    #             if 'Contents' in response:
-    #                 for obj in response['Contents']:
-    #                     key = obj['Key']
-    #                     if self._prefixed_bucket_path and key.startswith(self._prefixed_bucket_path + "/"):
-    #                         key = key[len(self._prefixed_bucket_path) + 1:]
-    #                     result.append(key)
+    async def batched_get(
+        self, keys: List[CacheEngineKey]
+    ) -> List[Optional[MemoryObj]]:
+        """
+        Batch get objects from S3 using RDMA.
+        """
+        # Store results with index mapping to track which position each result belongs to
+        memory_objs: List[Optional[MemoryObj]] = []
+        futures: List[asyncio.Future] = []
+        indices: List[int] = []  # Track which index each future corresponds to
 
-    #             if not response.get('IsTruncated', False):
-    #                 break
-    #             continuation_token = response.get('NextContinuationToken')
+        for idx, key in enumerate(keys):
+            s3_key = self._make_s3_key(key)
 
-    #         logger.debug("Listed %s objects from S3", len(result))
-    #         logger.debug("%s _list_objects_sync EXIT: count=%s", LOG_PREFIX, len(result))
-    #         return result
+            # Size check doesn't need semaphore
+            obj_size = await self.loop.run_in_executor(
+                None, self._get_object_size_sync, s3_key
+            )
+            if obj_size is None or obj_size <= 0:
+                self._object_size_cache[s3_key] = 0
+                memory_objs.append(None)
+                continue
+            
+            self._object_size_cache[s3_key] = obj_size
 
-    #     except Exception as e:
-    #         logger.error("Failed to list objects: %s", e)
-    #         logger.debug("%s _list_objects_sync EXIT: error", LOG_PREFIX)
-    #         raise
+            # Acquire semaphore for RDMA operation
+            await self._inflight_sema.acquire()
+
+            try:
+                # Allocate GPU memory for RDMA transfer
+                gpu_device = self.local_cpu_backend.dst_device
+                gpu_tensor = torch.empty(
+                    obj_size,
+                    dtype=torch.uint8,
+                    device=gpu_device
+                )
+
+                metadata = MemoryObjMetadata(
+                    shape=self.meta_shape,
+                    dtype=self.meta_dtype,
+                    address=gpu_tensor.data_ptr(),
+                    phy_size=obj_size,
+                    ref_count=1,
+                    pin_count=0,
+                    fmt=MemoryFormat.KV_2LTD
+                )
+
+                memory_obj = TensorMemoryObj(
+                    raw_data=gpu_tensor,
+                    metadata=metadata,
+                    parent_allocator=None
+                )
+
+                # Temporarily append to maintain index alignment
+                memory_objs.append(memory_obj)
+
+                # Verify GPU allocation
+                if not memory_obj.tensor.is_cuda:
+                    logger.error(
+                        "%s Allocated memory not on GPU for %s",
+                        LOG_PREFIX, s3_key
+                    )
+                    # Mark as failed and release immediately
+                    memory_objs[idx] = None
+                    memory_obj.invalidate()
+                    del memory_obj
+                    del gpu_tensor
+                    self._inflight_sema.release()
+                    continue
+
+                # Start RDMA transfer
+                _start = time.perf_counter_ns()
+                fut = self.loop.run_in_executor(
+                    None,
+                    self._get_object_sync,
+                    s3_key,
+                    memory_obj
+                )
+                fut = asyncio.wrap_future(fut)
+
+                # Add callback to release semaphore
+                fut.add_done_callback(
+                    partial(self.on_get_done, s3_key, memory_obj, _start)
+                )
+                
+                futures.append(fut)
+                indices.append(len(memory_objs) - 1)  # Track which position this future updates
+
+            except Exception as e:
+                logger.error(
+                    "%s Failed to initiate RDMA GET for %s: %s",
+                    LOG_PREFIX, s3_key, e
+                )
+                memory_objs.append(None)
+                self._inflight_sema.release()
+                continue
+
+        # Wait for all RDMA transfers to complete
+        results = await asyncio.gather(*futures, return_exceptions=True)
+        
+        # Post-process results: mark failed transfers as None
+        for idx, (result, mem_idx) in enumerate(zip(results, indices)):
+            if isinstance(result, Exception):
+                logger.error(
+                    "%s RDMA GET failed for index %d: %s",
+                    LOG_PREFIX, mem_idx, result
+                )
+                # Mark as None - cleanup already done in on_get_done
+                memory_objs[mem_idx] = None
+            elif result is False:
+                # _get_object_sync returned False (not found)
+                logger.debug(
+                    "%s Object not found for index %d",
+                    LOG_PREFIX, mem_idx
+                )
+                memory_objs[mem_idx] = None
+        
+        return memory_objs
+        
 
     async def list(self) -> List[str]:
-        # """List all objects."""
-        # logger.debug("%s list ENTER", LOG_PREFIX)
-        # result = await self.loop.run_in_executor(None, self._list_objects_sync)
-        # logger.debug("%s list EXIT: count=%d", LOG_PREFIX, len(result))
-        # return result
+        """List all objects."""
         raise NotImplementedError
 
     async def close(self) -> None:
         """Clean up resources."""
-        # logger.debug("%s close ENTER", LOG_PREFIX)
-        # logger.debug("Closing S3 RDMA connector")
-        if self._io_executor:
+        if self.pq_executor:
             try:
-                self._io_executor.shutdown(wait=True)
+                self.pq_executor.shutdown(wait=True)
             except Exception as e:
                 logger.warning("Error shutting down executor: %s", e)
+        
+        # Clean up client pool
+        self._client_pool.clear()
+        self._client_iterator = None
+
         self._object_size_cache.clear()
-        # logger.debug("S3 RDMA connector closed")
-        # logger.debug("%s close EXIT", LOG_PREFIX)
