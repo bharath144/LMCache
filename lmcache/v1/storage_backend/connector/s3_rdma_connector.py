@@ -16,6 +16,14 @@ from threading import Lock
 
 # Third Party
 import torch
+import mmap
+import tempfile
+from urllib.parse import quote as url_quote
+
+# Third Party (AWS CRT TCP client for baseline PUT path)
+from awscrt import auth, io, s3
+from awscrt.http import HttpHeaders, HttpRequest
+from awscrt.io import ClientTlsContext, TlsConnectionOptions, TlsContextOptions
 
 # First Party
 from lmcache.v1.memory_management import (
@@ -219,6 +227,31 @@ class S3RdmaConnector(RemoteConnector):
         self.pq_executor = AsyncPQExecutor(self.loop)
         logger.info("S3 RDMA connector initialization complete")
 
+        # Minimal AWS CRT S3 client init (TCP path) for PUT baseline comparison
+        event_loop_group = io.EventLoopGroup(self._effective_parallelism)
+        host_resolver = io.DefaultHostResolver(event_loop_group)
+        client_bootstrap = io.ClientBootstrap(event_loop_group, host_resolver)
+        self._credentials_provider = \
+            auth.AwsCredentialsProvider.new_default_chain(client_bootstrap)
+
+        tls_opts = None
+        try:
+            tls_ctx = ClientTlsContext(TlsContextOptions())
+            tls_opts = TlsConnectionOptions(tls_ctx)
+            tls_opts.set_alpn_list(["h2", "http/1.1"])  # best effort, ignore failures
+        except Exception:
+            tls_opts = None
+
+        logger.info("Initializing AWS CRT S3 TCP client for baseline PUT path")
+        self._tcp_s3_client = s3.S3Client(
+            bootstrap=client_bootstrap,
+            region="us-east-1",
+            credential_provider=self._credentials_provider,
+            enable_s3express=False,
+            tls_connection_options=tls_opts,
+            tls_mode=s3.S3RequestTlsMode.DISABLED,  # non-AWS or custom endpoints
+        )
+
     # Pick the next S3RdmaClient from the pool
     def _get_next_client(self) -> S3RdmaClient:
         """Get next client from pool using round-robin scheduling."""
@@ -235,6 +268,44 @@ class S3RdmaConnector(RemoteConnector):
         else:
             result = key_str
         return result
+
+    def _format_safe_path(self, s3_key: str) -> str:
+        """Create a URL-safe path segment for the CRT client."""
+        # Keep the key as-is to preserve '/' in object names
+        path = f"/{s3_key}"
+        return url_quote(path, safe="/")
+
+    def _tcp_s3_upload(self, s3_key: str, send_path: str):
+        """Issue a blocking PUT using AWS CRT similar to S3Connector."""
+        headers = HttpHeaders()
+
+        # Construct TCP endpoint: bucket.host:port from http://host:port
+        endpoint_stripped = self.settings.endpoint.replace("http://", "").replace("https://", "")
+        tcp_endpoint = f"{self.settings.bucket}.{endpoint_stripped}"
+        logger.info("%s Using TCP endpoint: %s", LOG_PREFIX, tcp_endpoint)
+
+        headers.add("Host", tcp_endpoint)
+        req = HttpRequest("PUT", self._format_safe_path(s3_key), headers)
+
+        done = {"err": None, "status": None}
+
+        def on_done(error=None, status_code=None, **kwargs):
+            done["err"] = error
+            done["status"] = status_code
+            if done["err"] or done["status"] not in (200, 201):
+                raise RuntimeError(f"Upload failed in S3RdmaConnector TCP path: {done}")
+
+        s3_req = s3.S3Request(
+            client=self._tcp_s3_client,
+            type=s3.S3RequestType.PUT_OBJECT,
+            request=req,
+            operation_name="PutObject",
+            send_filepath=send_path,
+            credential_provider=self._credentials_provider,
+            region=self.settings.region if self.settings.region else "us-east-1",
+            on_done=on_done,
+        )
+        return s3_req
 
     def _get_object_size_sync(self, s3_key: str) -> Optional[int]:
         """Get object size using S3 HEAD request (synchronous)."""
@@ -449,7 +520,17 @@ class S3RdmaConnector(RemoteConnector):
             raise
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        """Put object to S3 using RDMA."""
+        """Blocking TCP-like PUT (baseline) with staging copy, submitted via PQ.
+
+        Original (RDMA fire-and-forget) implementation retained below for reference:
+        # async def put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        #     return await self.pq_executor.submit_job(
+        #         self._put,
+        #         key=key,
+        #         memory_obj=memory_obj,
+        #         priority=Priorities.PUT,
+        #     )
+        """
         return await self.pq_executor.submit_job(
             self._put,
             key=key,
@@ -457,18 +538,95 @@ class S3RdmaConnector(RemoteConnector):
             priority=Priorities.PUT,
         )
 
-    # Fire and forget version of _put()
     async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        """Internal put implementation - fire and forget."""
+        """Internal blocking PUT implementation with ephemeral host staging.
+
+        Original (RDMA fire-and-forget) implementation retained below for reference:
+        # async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
+        #     s3_key = self._make_s3_key(key)
+        #     self.loop.run_in_executor(
+        #         None,
+        #         self._put_object_sync,
+        #         s3_key,
+        #         memory_obj
+        #     )
+        """
         s3_key = self._make_s3_key(key)
 
-        # Fire and forget - no await
-        self.loop.run_in_executor(
-            None,
-            self._put_object_sync,
-            s3_key,
-            memory_obj
+        # Assertions similar to TCP connector
+        assert memory_obj.get_physical_size() == self.full_chunk_size, (
+            "Saving unfull chunk is not supported in S3RdmaConnector TCP-like PUT"
         )
+
+        # Measure semaphore wait
+        sem_start = time.perf_counter_ns()
+        await self._inflight_sema.acquire()
+        sem_acquired = time.perf_counter_ns()
+
+        send_tmp = None
+        mm = None
+        try:
+            size_bytes = memory_obj.get_physical_size()
+
+            # Ephemeral /dev/shm staging file
+            send_tmp = tempfile.NamedTemporaryFile(
+                prefix="rdma_put_", suffix=".part", dir="/dev/shm", delete=False
+            )
+            os.ftruncate(send_tmp.fileno(), size_bytes)
+
+            with open(send_tmp.name, "r+b") as f:
+                mm = mmap.mmap(f.fileno(), size_bytes)
+                buf = ctypes.c_char.from_buffer(mm)
+                host_addr = ctypes.addressof(buf)
+
+            # Staging copy timing
+            copy_start = time.perf_counter_ns()
+            src_ptr = memory_obj.data_ptr
+            ctypes.memmove(host_addr, src_ptr, size_bytes)
+            copy_end = time.perf_counter_ns()
+
+            # Network PUT timing
+            net_start = time.perf_counter_ns()
+            s3_req = self._tcp_s3_upload(s3_key, send_tmp.name)
+            await asyncio.wrap_future(s3_req.finished_future)
+            net_end = time.perf_counter_ns()
+
+            total_end = net_end
+
+            # Update object size cache (mirroring TCP behavior)
+            self._object_size_cache[s3_key] = size_bytes
+
+            # Summary log line (mirrors TCP wording with RDMA prefix)
+            logger.info(
+                "%s TCP-like PUT completed in %.6f ms: %s. Transfer size: %s",
+                LOG_PREFIX,
+                (total_end - sem_start) / 1_000_000,
+                s3_key,
+                size_bytes,
+            )
+            # Detailed metrics line
+            logger.info(
+                "%s sem_wait_ms=%.6f copy_ms=%.6f net_ms=%.6f total_ms=%.6f key=%s size=%s",
+                LOG_PREFIX,
+                (sem_acquired - sem_start) / 1_000_000,
+                (copy_end - copy_start) / 1_000_000,
+                (net_end - net_start) / 1_000_000,
+                (total_end - sem_start) / 1_000_000,
+                s3_key,
+                size_bytes,
+            )
+        except Exception as e:
+            logger.error("Failed TCP-like PUT for %s: %s", s3_key, e)
+            raise
+        finally:
+            self._inflight_sema.release()
+            if mm is not None:
+                mm.close()
+            if send_tmp is not None:
+                try:
+                    os.unlink(send_tmp.name)
+                except FileNotFoundError:
+                    pass
 
     async def list(self) -> List[str]:
         """List all objects."""
