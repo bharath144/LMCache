@@ -403,20 +403,20 @@ class S3Connector(RemoteConnector):
         recv_path, shm = self.adhoc_shm_manager.allocate()
 
         _start = time.perf_counter_ns()
-
         s3_req = self._s3_download(
             key_str=key_str,
             recv_path=recv_path,
         )
-
         await asyncio.wrap_future(s3_req.finished_future)
 
         _end = time.perf_counter_ns()
-        _duration_ms = (_end - _start)
+        _duration_ms = _end - _start
 
         dst_ptr = memory_obj.data_ptr
         ctypes.memmove(dst_ptr, shm, obj_size)
-        logger.info("%s TCP GET completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
+        logger.info(
+            "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
+            LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
 
         self.adhoc_shm_manager.free(recv_path, shm)
 
@@ -432,6 +432,8 @@ class S3Connector(RemoteConnector):
         memory_obj: MemoryObj,
         shm: int,
         recv_path: str,
+        key_str: str,
+        start_time: int,
         fut: asyncio.Future,
     ):
         try:
@@ -442,8 +444,15 @@ class S3Connector(RemoteConnector):
             ctypes.memmove(dst_ptr, shm, obj_size)
 
             self.adhoc_shm_manager.free(recv_path, shm)
+
+            _end = time.perf_counter_ns()
+            _duration_ms = _end - start_time
+            logger.info(
+                "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
+                LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
+
         except Exception as e:
-            logger.error(f"on_get_done failed for {recv_path}: {e}")
+            logger.error("on_get_done failed for %s : %s", recv_path, str(e))
         finally:
             self.inflight_sema.release()
 
@@ -504,12 +513,9 @@ class S3Connector(RemoteConnector):
                 recv_path=recv_path,
             )
             fut = asyncio.wrap_future(s3_req.finished_future)
-            _end = time.perf_counter_ns()
-            _duration_ms = (_end - _start)
-            logger.info("%s TCP (Batched)GET completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
-
-            fut.add_done_callback(
-                partial(self.on_get_done, obj_size, memory_obj, shm, recv_path)
+            fut.add_done_callback(partial(
+                self.on_get_done, obj_size, memory_obj, shm, recv_path,
+                key_str, _start)
             )
             futures.append(fut)
 
