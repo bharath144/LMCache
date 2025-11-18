@@ -104,18 +104,23 @@ logger = init_logger(__name__)
 # Unique prefix for easy log filtering
 LOG_PREFIX = "[S3-RDMA]"
 
-# class Priorities(IntEnum):
-#     GET = auto()       # 1 - Cache retrieval (highest priority)
-#     PEEK = auto()      # 2 - Existence checks
-#     PREFETCH = auto()  # 3 - Background prefetching
-#     PUT = auto()       # 4 - Cache storage (lowest priority)
 
 class Priorities(IntEnum):
+    """
+    Priority levels for S3 RDMA operations.
+    This enum defines the execution priority order for different types of operations
+    in the S3 RDMA connector. Lower numeric values indicate higher priority.
+    Attributes:
+        GET: Highest priority for cache retrieval operations that block execution
+        PUT: Second highest priority for cache storage operations
+        PEEK: Medium priority for checking cache entry existence
+        PREFETCH: Lowest priority for background prefetching operations
+    """
     GET = auto()       # 1 - Cache retrieval (highest priority)
-    PUT = auto()       # 2 - Cache storage (2nd highest priority)
-    PEEK = auto()      # 3 - Existence checks
-    PREFETCH = auto()  # 4 - Background prefetching (lowest priority)
-   
+    PEEK = auto()      # 2- Existence checks
+    PREFETCH = auto()  # 3 - Background prefetching
+    PUT = auto()       # 4 - Cache storage
+
 
 class S3RdmaConnector(RemoteConnector):
     """
@@ -153,13 +158,6 @@ class S3RdmaConnector(RemoteConnector):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
-        #self._client: Optional[S3RdmaClient] = None
-        # self._client_lock = threading.Lock()
-        self._client_pool: List[S3RdmaClient] = []
-        self._client_pool_size: int = 16 # Number of clients in the pool
-        self._client_iterator: Optional[cycle] = None
-        self._client_lock = Lock()
-        
         self._boto_client = None
         self._object_size_cache: Dict[str, int] = {}
         self._inflight_sema: Optional[asyncio.Semaphore] = None
@@ -168,6 +166,11 @@ class S3RdmaConnector(RemoteConnector):
 
         self._prefixed_bucket_path = settings.prefix
         self._effective_parallelism = max(1, settings.max_parallel_requests)
+
+        self._client_pool: List[S3RdmaClient] = []
+        self._client_pool_size = max(4, self._effective_parallelism) # Number of clients in the pool
+        self._client_iterator: Optional[cycle] = None
+        self._client_lock = Lock()
 
     def post_init(self) -> None:
         """Initialize clients after event loop is set up."""
@@ -193,17 +196,21 @@ class S3RdmaConnector(RemoteConnector):
 
         #self._client = S3RdmaClient(client_config)
         #logger.info("S3 RDMA client initialized")
-        
+
         # Create pool of S3RdmaClient instances
         for i in range(self._client_pool_size):
             client = S3RdmaClient(client_config)
             self._client_pool.append(client)
-            logger.debug("%s Created S3 RDMA client %d/%d", LOG_PREFIX, i + 1, self._client_pool_size)
+            logger.debug(
+                "%s Created S3 RDMA client %d/%d",
+                LOG_PREFIX, i + 1, self._client_pool_size)
 
         # Create round-robin iterator
         self._client_iterator = cycle(self._client_pool)
-        
-        logger.info("%s S3 RDMA client pool initialized with %d clients", LOG_PREFIX, self._client_pool_size)
+
+        logger.info(
+            "%s S3 RDMA client pool initialized with %d clients",
+            LOG_PREFIX, self._client_pool_size)
 
         self._inflight_sema = asyncio.Semaphore(self._effective_parallelism)
         # self._io_executor = AsyncPQThreadPoolExecutor(
@@ -211,10 +218,12 @@ class S3RdmaConnector(RemoteConnector):
         # )
         self.pq_executor = AsyncPQExecutor(self.loop)
         logger.info("S3 RDMA connector initialization complete")
-    
+
     # Pick the next S3RdmaClient from the pool
     def _get_next_client(self) -> S3RdmaClient:
         """Get next client from pool using round-robin scheduling."""
+        assert self._client_iterator is not None
+
         with self._client_lock:
             return next(self._client_iterator)
 
@@ -271,6 +280,7 @@ class S3RdmaConnector(RemoteConnector):
         """Synchronous RDMA GET operation."""
         try:
             # Get the underlying storage
+            assert memory_obj.tensor is not None
             storage = memory_obj.tensor.untyped_storage()
 
             # Create a ctypes pointer to the storage's data
@@ -281,20 +291,22 @@ class S3RdmaConnector(RemoteConnector):
             # Create buffer from the storage using ctypes
             buffer = (ctypes.c_ubyte * storage_size).from_address(storage_ptr)
 
-            _client = self._get_next_client()
-            assert _client is not None
+            next_client = self._get_next_client()
+            assert next_client is not None
 
-            _start = time.perf_counter_ns()
-            _client.get_object_buffers(
+            start_perf = time.perf_counter_ns()
+            next_client.get_object_buffers(
                 BufferGetObject(
                     bucket=self.settings.bucket,
                     key=s3_key,
                     buffer=memoryview(buffer)
                     )
             )
-            _end = time.perf_counter_ns()
-            _duration_ms = (_end - _start)
-            logger.info("%s RDMA GET completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, s3_key, storage_size)
+            end_perf = time.perf_counter_ns()
+            perf_duration = end_perf - start_perf
+            logger.info(
+                "%s RDMA GET completed in %.6f ms: %s. Transfer size: %s",
+                LOG_PREFIX, perf_duration / 1_000_000, s3_key, storage_size)
 
             return True
 
@@ -379,6 +391,7 @@ class S3RdmaConnector(RemoteConnector):
                 return None
 
             # Semaphore handling for RDMA operation
+            assert self._inflight_sema is not None
             await self._inflight_sema.acquire()
             try:
                 success = await self.loop.run_in_executor(
@@ -457,179 +470,6 @@ class S3RdmaConnector(RemoteConnector):
             memory_obj
         )
 
-    # Returns immediately without waiting
-    # async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-    #     """Internal put implementation with semaphore handling."""
-    #     s3_key = self._make_s3_key(key)
-
-    #     await self._inflight_sema.acquire()
-    #     try:
-    #         await self.loop.run_in_executor(
-    #             None,
-    #             self._put_object_sync,
-    #             s3_key,
-    #             memory_obj
-    #         )
-    #     finally:
-    #         self._inflight_sema.release()
-
-    def support_batched_get(self) -> bool:
-        return True
-
-    def on_get_done(
-        self,
-        s3_key: str,
-        memory_obj: Optional[MemoryObj],
-        _start: int,
-        fut: asyncio.Future,
-    ):
-        """Callback to release semaphore after RDMA GET completes."""
-        try:
-            if fut.exception():
-                logger.error("RDMA GET failed for %s: %s", s3_key, fut.exception())
-                # Clean up the failed memory object
-                if memory_obj is not None:
-                    try:
-                        memory_obj.invalidate()
-                        # Help GC by breaking references
-                        if hasattr(memory_obj, 'raw_data'):
-                            del memory_obj.raw_data
-                    except Exception as cleanup_error:
-                        logger.warning(
-                            "Error during memory cleanup for %s: %s",
-                            s3_key, cleanup_error
-                        )
-            else:
-                _end = time.perf_counter_ns()
-                _duration_ms = (_end - _start)
-                logger.info("%s RDMA (Batched)GET completed in %.6f ms: %s. Transfer size: %s",
-                            LOG_PREFIX, _duration_ms / 1_000_000, 
-                            s3_key, memory_obj.get_physical_size())
-        except Exception as e:
-            logger.error("on_get_done callback error for %s: %s", s3_key, e)
-        finally:
-            self._inflight_sema.release()
-
-    async def batched_get(
-        self, keys: List[CacheEngineKey]
-    ) -> List[Optional[MemoryObj]]:
-        """
-        Batch get objects from S3 using RDMA.
-        """
-        # Store results with index mapping to track which position each result belongs to
-        memory_objs: List[Optional[MemoryObj]] = []
-        futures: List[asyncio.Future] = []
-        indices: List[int] = []  # Track which index each future corresponds to
-
-        for idx, key in enumerate(keys):
-            s3_key = self._make_s3_key(key)
-
-            # Size check doesn't need semaphore
-            obj_size = await self.loop.run_in_executor(
-                None, self._get_object_size_sync, s3_key
-            )
-            if obj_size is None or obj_size <= 0:
-                self._object_size_cache[s3_key] = 0
-                memory_objs.append(None)
-                continue
-            
-            self._object_size_cache[s3_key] = obj_size
-
-            # Acquire semaphore for RDMA operation
-            await self._inflight_sema.acquire()
-
-            try:
-                # Allocate GPU memory for RDMA transfer
-                gpu_device = self.local_cpu_backend.dst_device
-                gpu_tensor = torch.empty(
-                    obj_size,
-                    dtype=torch.uint8,
-                    device=gpu_device
-                )
-
-                metadata = MemoryObjMetadata(
-                    shape=self.meta_shape,
-                    dtype=self.meta_dtype,
-                    address=gpu_tensor.data_ptr(),
-                    phy_size=obj_size,
-                    ref_count=1,
-                    pin_count=0,
-                    fmt=MemoryFormat.KV_2LTD
-                )
-
-                memory_obj = TensorMemoryObj(
-                    raw_data=gpu_tensor,
-                    metadata=metadata,
-                    parent_allocator=None
-                )
-
-                # Temporarily append to maintain index alignment
-                memory_objs.append(memory_obj)
-
-                # Verify GPU allocation
-                if not memory_obj.tensor.is_cuda:
-                    logger.error(
-                        "%s Allocated memory not on GPU for %s",
-                        LOG_PREFIX, s3_key
-                    )
-                    # Mark as failed and release immediately
-                    memory_objs[idx] = None
-                    memory_obj.invalidate()
-                    del memory_obj
-                    del gpu_tensor
-                    self._inflight_sema.release()
-                    continue
-
-                # Start RDMA transfer
-                _start = time.perf_counter_ns()
-                fut = self.loop.run_in_executor(
-                    None,
-                    self._get_object_sync,
-                    s3_key,
-                    memory_obj
-                )
-                fut = asyncio.wrap_future(fut)
-
-                # Add callback to release semaphore
-                fut.add_done_callback(
-                    partial(self.on_get_done, s3_key, memory_obj, _start)
-                )
-                
-                futures.append(fut)
-                indices.append(len(memory_objs) - 1)  # Track which position this future updates
-
-            except Exception as e:
-                logger.error(
-                    "%s Failed to initiate RDMA GET for %s: %s",
-                    LOG_PREFIX, s3_key, e
-                )
-                memory_objs.append(None)
-                self._inflight_sema.release()
-                continue
-
-        # Wait for all RDMA transfers to complete
-        results = await asyncio.gather(*futures, return_exceptions=True)
-        
-        # Post-process results: mark failed transfers as None
-        for idx, (result, mem_idx) in enumerate(zip(results, indices)):
-            if isinstance(result, Exception):
-                logger.error(
-                    "%s RDMA GET failed for index %d: %s",
-                    LOG_PREFIX, mem_idx, result
-                )
-                # Mark as None - cleanup already done in on_get_done
-                memory_objs[mem_idx] = None
-            elif result is False:
-                # _get_object_sync returned False (not found)
-                logger.debug(
-                    "%s Object not found for index %d",
-                    LOG_PREFIX, mem_idx
-                )
-                memory_objs[mem_idx] = None
-        
-        return memory_objs
-        
-
     async def list(self) -> List[str]:
         """List all objects."""
         raise NotImplementedError
@@ -641,7 +481,7 @@ class S3RdmaConnector(RemoteConnector):
                 self.pq_executor.shutdown(wait=True)
             except Exception as e:
                 logger.warning("Error shutting down executor: %s", e)
-        
+
         # Clean up client pool
         self._client_pool.clear()
         self._client_iterator = None
