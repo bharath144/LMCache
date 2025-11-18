@@ -558,16 +558,16 @@ class S3RdmaConnector(RemoteConnector):
             "Saving unfull chunk is not supported in S3RdmaConnector TCP-like PUT"
         )
 
-        # Measure semaphore wait
-        sem_start = time.perf_counter_ns()
         await self._inflight_sema.acquire()
-        sem_acquired = time.perf_counter_ns()
 
         send_tmp = None
         mm = None
         try:
             size_bytes = memory_obj.get_physical_size()
 
+            # Start of perf measurement
+            start_perf = time.perf_counter_ns()
+            
             # Ephemeral /dev/shm staging file
             send_tmp = tempfile.NamedTemporaryFile(
                 prefix="rdma_put_", suffix=".part", dir="/dev/shm", delete=False
@@ -580,41 +580,30 @@ class S3RdmaConnector(RemoteConnector):
                 host_addr = ctypes.addressof(buf)
 
             # Staging copy timing
-            copy_start = time.perf_counter_ns()
             src_ptr = memory_obj.data_ptr
             ctypes.memmove(host_addr, src_ptr, size_bytes)
-            copy_end = time.perf_counter_ns()
 
-            # Network PUT timing
-            net_start = time.perf_counter_ns()
             s3_req = self._tcp_s3_upload(s3_key, send_tmp.name)
             await asyncio.wrap_future(s3_req.finished_future)
-            net_end = time.perf_counter_ns()
+            
+            # End of perf measurement
+            end_perf = time.perf_counter_ns()
 
-            total_end = net_end
+            perf_duration = end_perf - start_perf
 
             # Update object size cache (mirroring TCP behavior)
             self._object_size_cache[s3_key] = size_bytes
 
             # Summary log line (mirrors TCP wording with RDMA prefix)
+            logger.info("%s Starting TCP-like Upload", LOG_PREFIX)
             logger.info(
-                "%s TCP-like PUT completed in %.6f ms: %s. Transfer size: %s",
+                "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
                 LOG_PREFIX,
-                (total_end - sem_start) / 1_000_000,
+                perf_duration / 1_000_000,
                 s3_key,
                 size_bytes,
             )
-            # Detailed metrics line
-            logger.info(
-                "%s sem_wait_ms=%.6f copy_ms=%.6f net_ms=%.6f total_ms=%.6f key=%s size=%s",
-                LOG_PREFIX,
-                (sem_acquired - sem_start) / 1_000_000,
-                (copy_end - copy_start) / 1_000_000,
-                (net_end - net_start) / 1_000_000,
-                (total_end - sem_start) / 1_000_000,
-                s3_key,
-                size_bytes,
-            )
+
         except Exception as e:
             logger.error("Failed TCP-like PUT for %s: %s", s3_key, e)
             raise
