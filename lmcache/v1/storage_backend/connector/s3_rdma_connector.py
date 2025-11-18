@@ -282,7 +282,6 @@ class S3RdmaConnector(RemoteConnector):
         # Construct TCP endpoint: bucket.host:port from http://host:port
         endpoint_stripped = self.settings.endpoint.replace("http://", "").replace("https://", "")
         tcp_endpoint = f"{self.settings.bucket}.{endpoint_stripped}"
-        logger.info("%s Using TCP endpoint: %s", LOG_PREFIX, tcp_endpoint)
 
         headers.add("Host", tcp_endpoint)
         req = HttpRequest("PUT", self._format_safe_path(s3_key), headers)
@@ -322,7 +321,7 @@ class S3RdmaConnector(RemoteConnector):
             return size
         except Exception as e:
             logger.debug("Failed to get size for %s: %s", s3_key, e)
-            return None
+            return 0
 
     async def exists(self, key: CacheEngineKey) -> bool:
         """Check if key exists in S3."""
@@ -335,17 +334,30 @@ class S3RdmaConnector(RemoteConnector):
     async def _exists(self, key: CacheEngineKey) -> bool:
         """Internal exists implementation."""
         s3_key = self._make_s3_key(key)
+        start_perf = time.perf_counter_ns()
         # Use run_in_executor since HPE client is sync
         size = await self.loop.run_in_executor(
             None, self._get_object_size_sync, s3_key
         )
-        return size is not None
+        end_perf = time.perf_counter_ns()
+        perf_duration = end_perf - start_perf
+        logger.info(
+            "%s RDMA EXISTS check completed in %.6f ms: %s, size: %s",
+            LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
+        return size != 0
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
         """Synchronous version of exists."""
         s3_key = self._make_s3_key(key)
-        result = self._get_object_size_sync(s3_key) is not None
-        return result
+        start_perf = time.perf_counter_ns()
+        size = self._get_object_size_sync(s3_key) is not None
+        end_perf = time.perf_counter_ns()
+        perf_duration = end_perf - start_perf
+        logger.info(
+            "%s RDMA EXISTS SYNC check completed in %.6f ms: %s, size: %s",
+            LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
+        
+        return size != 0
 
     def _get_object_sync(self, s3_key: str, memory_obj: MemoryObj) -> bool:
         """Synchronous RDMA GET operation."""
@@ -595,7 +607,6 @@ class S3RdmaConnector(RemoteConnector):
             self._object_size_cache[s3_key] = size_bytes
 
             # Summary log line (mirrors TCP wording with RDMA prefix)
-            logger.info("%s Starting TCP-like Upload", LOG_PREFIX)
             logger.info(
                 "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
                 LOG_PREFIX,
