@@ -158,13 +158,6 @@ class S3RdmaConnector(RemoteConnector):
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
 
-        #self._client: Optional[S3RdmaClient] = None
-        # self._client_lock = threading.Lock()
-        self._client_pool: List[S3RdmaClient] = []
-        self._client_pool_size: int = 16 # Number of clients in the pool
-        self._client_iterator: Optional[cycle] = None
-        self._client_lock = Lock()
-
         self._boto_client = None
         self._object_size_cache: Dict[str, int] = {}
         self._inflight_sema: Optional[asyncio.Semaphore] = None
@@ -173,6 +166,11 @@ class S3RdmaConnector(RemoteConnector):
 
         self._prefixed_bucket_path = settings.prefix
         self._effective_parallelism = max(1, settings.max_parallel_requests)
+
+        self._client_pool: List[S3RdmaClient] = []
+        self._client_pool_size = max(4, self._effective_parallelism) # Number of clients in the pool
+        self._client_iterator: Optional[cycle] = None
+        self._client_lock = Lock()
 
     def post_init(self) -> None:
         """Initialize clients after event loop is set up."""
