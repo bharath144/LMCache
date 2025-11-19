@@ -306,22 +306,79 @@ class S3RdmaConnector(RemoteConnector):
         )
         return s3_req
 
-    def _get_object_size_sync(self, s3_key: str) -> Optional[int]:
-        """Get object size using S3 HEAD request (synchronous)."""
-        if s3_key in self._object_size_cache:
-            return self._object_size_cache[s3_key]
+    def _get_object_size_sync(self, key_str: str) -> int:
+        if key_str in self._object_size_cache:
+            return self._object_size_cache[key_str]
+
+        headers = HttpHeaders()
+
+        # Construct TCP endpoint: bucket.host:port from http://host:port
+        endpoint_stripped = self.settings.endpoint.replace("http://", "").replace("https://", "")
+        tcp_endpoint = f"{self.settings.bucket}.{endpoint_stripped}"
+
+        headers.add("Host", tcp_endpoint)
+        req = HttpRequest("HEAD", self._format_safe_path(key_str), headers)
+
+        got = {"len": None, "status": None, "err": None}
+
+        def on_headers(status_code, headers, **kwargs):
+            got["status"] = status_code
+            for name, value in headers:
+                if name.lower() == "content-length":
+                    try:
+                        got["len"] = int(value)
+                    except Exception:
+                        pass
+
+        def on_done(error=None, **kwargs):
+            got["err"] = error
+
+        s3_req = s3.S3Request(
+            client=self._tcp_s3_client,
+            type=s3.S3RequestType.DEFAULT,
+            request=req,
+            operation_name="HeadObject",
+            on_headers=on_headers,
+            on_done=on_done,
+            credential_provider=self._credentials_provider,
+            region=self.settings.region,
+        )
 
         try:
-            _client = self._get_next_client()
-            size = _client.get_object_size(
-                bucket=self.settings.bucket,
-                key=s3_key
-            )
-            self._object_size_cache[s3_key] = size
-            return size
+            s3_req.finished_future.result()
         except Exception as e:
-            logger.debug("Failed to get size for %s: %s", s3_key, e)
+            logger.debug(f"Exception in `_get_object_size`: {e}")
             return 0
+
+        if got["err"] or got["status"] != 200:
+            logger.warning(
+                "Encountering error in S3 HEAD request "
+                f"with error code: {got['status']}"
+            )
+            return 0
+
+        if got["len"] is not None:
+            self._object_size_cache[key_str] = got["len"]
+            return got["len"]
+
+        return 0
+
+    # def _get_object_size_sync(self, s3_key: str) -> Optional[int]:
+    #     """Get object size using S3 HEAD request (synchronous)."""
+    #     if s3_key in self._object_size_cache:
+    #         return self._object_size_cache[s3_key]
+
+    #     try:
+    #         _client = self._get_next_client()
+    #         size = _client.get_object_size(
+    #             bucket=self.settings.bucket,
+    #             key=s3_key
+    #         )
+    #         self._object_size_cache[s3_key] = size
+    #         return size
+    #     except Exception as e:
+    #         logger.debug("Failed to get size for %s: %s", s3_key, e)
+    #         return 0
 
     async def exists(self, key: CacheEngineKey) -> bool:
         """Check if key exists in S3."""
@@ -334,29 +391,36 @@ class S3RdmaConnector(RemoteConnector):
     async def _exists(self, key: CacheEngineKey) -> bool:
         """Internal exists implementation."""
         s3_key = self._make_s3_key(key)
+
         start_perf = time.perf_counter_ns()
-        # Use run_in_executor since HPE client is sync
+
+         # Use run_in_executor since HPE client is sync
         size = await self.loop.run_in_executor(
             None, self._get_object_size_sync, s3_key
         )
+
         end_perf = time.perf_counter_ns()
         perf_duration = end_perf - start_perf
         logger.info(
-            "%s RDMA EXISTS check completed in %.6f ms: %s, size: %s",
+            "%s S3 HEAD completed in %.6f ms: %s. Size: %s",
             LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
+
         return size != 0
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
         """Synchronous version of exists."""
         s3_key = self._make_s3_key(key)
+
         start_perf = time.perf_counter_ns()
-        size = self._get_object_size_sync(s3_key) is not None
+
+        size = self._get_object_size_sync(s3_key)
+
         end_perf = time.perf_counter_ns()
         perf_duration = end_perf - start_perf
         logger.info(
-            "%s RDMA EXISTS SYNC check completed in %.6f ms: %s, size: %s",
+            "%s S3 HEAD completed in %.6f ms: %s. Size: %s",
             LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
-        
+
         return size != 0
 
     def _get_object_sync(self, s3_key: str, memory_obj: MemoryObj) -> bool:
@@ -424,7 +488,8 @@ class S3RdmaConnector(RemoteConnector):
             size = await self.loop.run_in_executor(
                 None, self._get_object_size_sync, s3_key
             )
-            if size is None:
+
+            if size == 0:
                 return None
 
             # Allocate GPU memory directly for RDMA transfer
@@ -579,7 +644,7 @@ class S3RdmaConnector(RemoteConnector):
 
             # Start of perf measurement
             start_perf = time.perf_counter_ns()
-            
+
             # Ephemeral /dev/shm staging file
             send_tmp = tempfile.NamedTemporaryFile(
                 prefix="rdma_put_", suffix=".part", dir="/dev/shm", delete=False
@@ -597,7 +662,7 @@ class S3RdmaConnector(RemoteConnector):
 
             s3_req = self._tcp_s3_upload(s3_key, send_tmp.name)
             await asyncio.wrap_future(s3_req.finished_future)
-            
+
             # End of perf measurement
             end_perf = time.perf_counter_ns()
 
