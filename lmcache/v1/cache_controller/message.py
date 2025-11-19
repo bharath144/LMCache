@@ -5,6 +5,9 @@ from typing import Dict, Optional, Tuple, Union
 # Third Party
 import msgspec
 
+# First Party
+from lmcache.v1.cache_controller.utils import WorkerInfo
+
 
 class MsgBase(msgspec.Struct, tag=True):  # type: ignore
     """Base class for all messages"""
@@ -38,7 +41,8 @@ class RegisterMsg(WorkerMsg):
     worker_id: int
     ip: str
     port: int
-    distributed_url: str  # URL for actual KV cache transfer
+    # URL for actual KV cache transfer, only useful when p2p is enabled
+    distributed_url: Optional[str]
 
     def describe(self) -> str:
         return (
@@ -432,6 +436,17 @@ class CheckFinishMsg(OrchMsg):
         return f"Checking finish for event {self.event_id}"
 
 
+class QueryWorkerInfoMsg(OrchMsg):
+    """Query worker info message"""
+
+    event_id: str
+    instance_id: str
+    worker_ids: Optional[list[int]]
+
+    def describe(self) -> str:
+        return f"Query worker info of {self.instance_id} : {self.worker_ids}"
+
+
 class OrchRetMsg(MsgBase):
     """Return message from Controller to Ochestrator"""
 
@@ -529,6 +544,16 @@ class CheckFinishRetMsg(OrchRetMsg):
         return f"Event status: {self.status}"
 
 
+class QueryWorkerInfoRetMsg(OrchRetMsg):
+    """Query worker info return message"""
+
+    event_id: str
+    worker_infos: list[WorkerInfo]
+
+    def describe(self) -> str:
+        return f"worker infos: {self.worker_infos}"
+
+
 class ErrorMsg(MsgBase):
     """Control Error Message"""
 
@@ -579,4 +604,6 @@ Msg = Union[
     HeartbeatMsg,
     BatchedP2PLookupMsg,
     BatchedP2PLookupRetMsg,
+    QueryWorkerInfoMsg,
+    QueryWorkerInfoRetMsg,
 ]

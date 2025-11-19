@@ -301,6 +301,8 @@ def _allocate_cpu_memory(
     size: int,
     numa_mapping: Optional[NUMAMapping] = None,
 ) -> torch.Tensor:
+    if size == 0:
+        return torch.empty(0, dtype=torch.uint8)
     if numa_mapping:
         if torch.cuda.is_available():
             current_device_id = torch.cuda.current_device()
@@ -336,8 +338,8 @@ class TensorMemoryObj(MemoryObj):
         parent_allocator: Optional["MemoryAllocatorInterface"],
     ):
         assert metadata.dtype is not None, "dtype must be specified for TensorMemoryObj"
+        super().__init__(metadata)
         self.raw_data = raw_data
-        self.meta = metadata
         self.valid = True
         self.lock = threading.Lock()
         self.parent_allocator = parent_allocator
@@ -486,7 +488,7 @@ class BytesBufferMemoryObj(MemoryObj):
         self.raw_data = raw_bytes
         if metadata is None:
             bytes_shape = torch.Size([len(self.raw_data), 0, 0, 0])
-            self.meta = MemoryObjMetadata(
+            metadata = MemoryObjMetadata(
                 shape=bytes_shape,
                 dtype=None,
                 address=0,
@@ -495,8 +497,7 @@ class BytesBufferMemoryObj(MemoryObj):
                 pin_count=0,
                 fmt=MemoryFormat.BINARY_BUFFER,
             )
-        else:
-            self.meta = metadata
+        super().__init__(metadata)
         self.valid = True
 
     def invalidate(self):
@@ -708,6 +709,18 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
     def _Compute_aligned_size(raw_size: int, align: int) -> int:
         return (raw_size + align - 1) & ~(align - 1)
 
+    def _can_merge_with_prev(
+        self, curr_block: FreeBlock, prev_block: FreeBlock
+    ) -> bool:
+        """Hook: Check if curr_block can merge with prev_block."""
+        return prev_block.can_be_coalesced(curr_block)
+
+    def _can_merge_with_succ(
+        self, curr_block: FreeBlock, succ_block: FreeBlock
+    ) -> bool:
+        """Hook: Check if curr_block can merge with succ_block."""
+        return curr_block.can_be_coalesced(succ_block)
+
     @_lmcache_nvtx_annotate
     def _coalesce(
         self,
@@ -721,15 +734,12 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
 
         Returns True if the current block was coalesced, otherwise False.
         """
-        if prev_block is not None and prev_block.can_be_coalesced(curr_block):
-            merge_prev = True
-        else:
-            merge_prev = False
-
-        if succ_block is not None and curr_block.can_be_coalesced(succ_block):
-            merge_succ = True
-        else:
-            merge_succ = False
+        merge_prev = prev_block is not None and self._can_merge_with_prev(
+            curr_block, prev_block
+        )
+        merge_succ = succ_block is not None and self._can_merge_with_succ(
+            curr_block, succ_block
+        )
 
         if merge_prev and merge_succ:
             prev_block.size += curr_block.size + succ_block.size  # type: ignore
@@ -798,13 +808,18 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
         self.stats_monitor.update_active_memory_objs_count(self.num_active_allocations)
 
         # Allocate the block
+        raw_data = self._get_buffer_slice(block.start, raw_size)
         return TensorMemoryObj(
-            raw_data=self.buffer[block.start : block.start + raw_size],
+            raw_data=raw_data,
             metadata=MemoryObjMetadata(
-                shape, dtype, block.start, aligned_size, 1, False, fmt
+                shape, dtype, block.start, aligned_size, 1, 0, fmt
             ),
             parent_allocator=self,
         )
+
+    def _get_buffer_slice(self, start: int, size: int) -> torch.Tensor:
+        """Hook: Get buffer slice. Override for custom buffer access."""
+        return self.buffer[start : start + size]
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
@@ -876,7 +891,7 @@ class TensorMemoryAllocator(MemoryAllocatorInterface):
                 TensorMemoryObj(
                     raw_data=raw_data,
                     metadata=MemoryObjMetadata(
-                        shape, dtype, temp_start, unit_aligned_size, 1, False, fmt
+                        shape, dtype, temp_start, unit_aligned_size, 1, 0, fmt
                     ),
                     parent_allocator=self,
                 )
@@ -1407,10 +1422,13 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
         :param int size: The size of the pinned memory in bytes.
         """
 
-        ptr = lmc_ops.alloc_pinned_ptr(size, 0)
-        array_type = ctypes.c_uint8 * size
-        buf = array_type.from_address(ptr)
-        self.buffer = torch.frombuffer(buf, dtype=torch.uint8)
+        if size == 0:
+            self.buffer = torch.empty(0, dtype=torch.uint8)
+        else:
+            ptr = lmc_ops.alloc_pinned_ptr(size, 0)
+            array_type = ctypes.c_uint8 * size
+            buf = array_type.from_address(ptr)
+            self.buffer = torch.frombuffer(buf, dtype=torch.uint8)
         self._unregistered = False
 
         self.allocator: MemoryAllocatorInterface
@@ -1481,6 +1499,8 @@ class PinMemoryAllocator(MemoryAllocatorInterface):
         if not self._unregistered:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            if self.buffer.numel() == 0:
+                return
             lmc_ops.free_pinned_ptr(self.buffer.data_ptr())
             self._unregistered = True
 
@@ -1622,6 +1642,8 @@ class MixedMemoryAllocator(MemoryAllocatorInterface):
         if not self._unregistered:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            if self.buffer.numel() == 0:
+                return
             if self.numa_mapping:
                 lmc_ops.free_pinned_numa_ptr(self.buffer.data_ptr(), self.size)
             else:
@@ -1878,6 +1900,7 @@ class PagedCpuGpuMemoryAllocator(MemoryAllocatorInterface):
             dtype,
             fmt,
         )
+        self.align_bytes = self.cpu_allocator.align_bytes
 
     def allocate(
         self,
