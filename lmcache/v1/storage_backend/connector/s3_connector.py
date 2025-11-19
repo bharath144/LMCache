@@ -175,6 +175,7 @@ class S3Connector(RemoteConnector):
 
         self.inflight_sema = asyncio.Semaphore(s3_max_inflight_reqs)
         self.pq_executor = AsyncPQExecutor(loop)
+        self._pending_puts: set = set()
 
     def post_init(self):
         logger.info("Post-initializing S3 connector")
@@ -556,50 +557,120 @@ class S3Connector(RemoteConnector):
         )
         return s3_req
 
-    async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj):
-        """
-        Store data to S3
-        """
+    # async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj):
+    #     """
+    #     Store data to S3
+    #     """
 
+    #     key_str = key.to_string()
+
+    #     # TODO(Jiayi): Please support this
+    #     assert memory_obj.get_physical_size() == self.s3_part_size, (
+    #         "Saving unfull chunk is not supported in S3Connector."
+    #     )
+
+    #     await self.inflight_sema.acquire()
+    #     send_path, shm = self.adhoc_shm_manager.allocate()
+    #     logger.debug("Allocated shared memory for S3 upload")
+
+    #     try:
+    #         buffer_ptr = memory_obj.data_ptr
+    #         ctypes.memmove(shm, buffer_ptr, memory_obj.get_physical_size())
+    #         logger.debug("Data copy to S3 buffer completed")
+
+    #         _start = time.perf_counter_ns()
+    #         s3_req = self._s3_upload(key_str, send_path)
+    #         await asyncio.wrap_future(s3_req.finished_future)
+    #         _end = time.perf_counter_ns()
+    #         _duration_ms = (_end - _start)
+    #         logger.info("%s TCP PUT completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, memory_obj.get_physical_size())
+
+    #         self.object_size_cache[key_str] = memory_obj.get_physical_size()
+    #         logger.debug(f"Uploaded {key_str} to S3 successfully")
+    #     except Exception as e:
+    #         logger.error(f"Failed to upload {key_str} to S3: {e}")
+    #         raise
+    #     finally:
+    #         self.inflight_sema.release()
+    #         self.adhoc_shm_manager.free(send_path, shm)
+
+    async def _put_background(self, key: CacheEngineKey, memory_obj: MemoryObj):
+        """Background put implementation."""
         key_str = key.to_string()
 
-        # TODO(Jiayi): Please support this
-        assert memory_obj.get_physical_size() == self.s3_part_size, (
-            "Saving unfull chunk is not supported in S3Connector."
-        )
-
-        await self.inflight_sema.acquire()
-        send_path, shm = self.adhoc_shm_manager.allocate()
-        logger.debug("Allocated shared memory for S3 upload")
-
         try:
-            buffer_ptr = memory_obj.data_ptr
-            ctypes.memmove(shm, buffer_ptr, memory_obj.get_physical_size())
-            logger.debug("Data copy to S3 buffer completed")
+            assert memory_obj.get_physical_size() == self.s3_part_size, (
+                "Saving unfull chunk is not supported in S3Connector."
+            )
 
-            _start = time.perf_counter_ns()
-            s3_req = self._s3_upload(key_str, send_path)
-            await asyncio.wrap_future(s3_req.finished_future)
-            _end = time.perf_counter_ns()
-            _duration_ms = (_end - _start)
-            logger.info("%s TCP PUT completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, memory_obj.get_physical_size())
+            await self.inflight_sema.acquire()
+            send_path, shm = self.adhoc_shm_manager.allocate()
+            logger.debug("Allocated shared memory for S3 upload")
 
-            self.object_size_cache[key_str] = memory_obj.get_physical_size()
-            logger.debug(f"Uploaded {key_str} to S3 successfully")
+            try:
+                buffer_ptr = memory_obj.data_ptr
+                ctypes.memmove(shm, buffer_ptr, memory_obj.get_physical_size())
+                logger.debug("Data copy to S3 buffer completed")
+
+                _start = time.perf_counter_ns()
+                s3_req = self._s3_upload(key_str, send_path)
+                await asyncio.wrap_future(s3_req.finished_future)
+                _end = time.perf_counter_ns()
+                _duration_ms = (_end - _start)
+                logger.info("%s TCP PUT completed in %.6f ms: %s. Transfer size: %s",
+                        LOG_PREFIX, _duration_ms / 1_000_000, key_str,
+                        memory_obj.get_physical_size())
+
+                self.object_size_cache[key_str] = memory_obj.get_physical_size()
+                logger.debug(f"Uploaded {key_str} to S3 successfully")
+            except Exception as e:
+                logger.error(f"Failed to upload {key_str} to S3: {e}")
+            finally:
+                self.inflight_sema.release()
+                self.adhoc_shm_manager.free(send_path, shm)
         except Exception as e:
-            logger.error(f"Failed to upload {key_str} to S3: {e}")
+            logger.error(f"Background PUT failed for {key_str}: {e}")
             raise
         finally:
-            self.inflight_sema.release()
-            self.adhoc_shm_manager.free(send_path, shm)
+            # Decrement ref count after transfer completes
+            memory_obj.ref_count_down()
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
-        return await self.pq_executor.submit_job(
-            self._put,
-            key=key,
-            memory_obj=memory_obj,
-            priority=Priorities.PUT,
+        """Store data to S3 - fire and forget."""
+        # Increment ref count to keep memory alive
+        #memory_obj.ref_count_up()
+
+        # Create background task without awaiting
+        task = self.loop.create_task(
+            self._put_background(key, memory_obj)
         )
+
+        # Track task to prevent GC
+        self._pending_puts.add(task)
+        
+        # Create a future that can be returned
+        future = asyncio.Future()
+        
+        def on_complete(t):
+            self._pending_puts.discard(t)
+            try:
+                t.result()  # Propagate exceptions
+                future.set_result(None)
+            except Exception as e:
+                future.set_exception(e)
+        
+        task.add_done_callback(on_complete)
+        
+        # Return the future so callers can wait if needed
+        return future
+
+    # async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
+    #     return await self.pq_executor.submit_job(
+    #         self._put,
+    #         key=key,
+    #         memory_obj=memory_obj,
+    #         priority=Priorities.PUT,
+    #     )
 
     def support_batched_async_contains(self) -> bool:
         return True
@@ -675,5 +746,10 @@ class S3Connector(RemoteConnector):
         return True
 
     async def close(self):
+        # Wait for pending puts
+        if self._pending_puts:
+            logger.info("Waiting for %d pending PUT operations", len(self._pending_puts))
+            await asyncio.gather(*self._pending_puts, return_exceptions=True)
+
         await self.pq_executor.shutdown(wait=True)
         self.adhoc_shm_manager.close()

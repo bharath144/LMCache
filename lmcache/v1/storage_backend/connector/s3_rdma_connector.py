@@ -16,6 +16,12 @@ from threading import Lock
 
 # Third Party
 import torch
+from urllib.parse import quote as url_quote
+
+# Third Party (AWS CRT TCP client)
+from awscrt import auth, io, s3
+from awscrt.http import HttpHeaders, HttpRequest
+from awscrt.io import ClientTlsContext, TlsConnectionOptions, TlsContextOptions
 
 # First Party
 from lmcache.v1.memory_management import (
@@ -172,6 +178,8 @@ class S3RdmaConnector(RemoteConnector):
         self._client_iterator: Optional[cycle] = None
         self._client_lock = Lock()
 
+        self._pending_puts: set = set()
+
     def post_init(self) -> None:
         """Initialize clients after event loop is set up."""
         super().post_init()
@@ -219,6 +227,31 @@ class S3RdmaConnector(RemoteConnector):
         self.pq_executor = AsyncPQExecutor(self.loop)
         logger.info("S3 RDMA connector initialization complete")
 
+        # Minimal AWS CRT S3 client init
+        event_loop_group = io.EventLoopGroup(self._effective_parallelism)
+        host_resolver = io.DefaultHostResolver(event_loop_group)
+        client_bootstrap = io.ClientBootstrap(event_loop_group, host_resolver)
+        self._credentials_provider = \
+            auth.AwsCredentialsProvider.new_default_chain(client_bootstrap)
+
+        tls_opts = None
+        try:
+            tls_ctx = ClientTlsContext(TlsContextOptions())
+            tls_opts = TlsConnectionOptions(tls_ctx)
+            tls_opts.set_alpn_list(["h2", "http/1.1"])  # best effort, ignore failures
+        except Exception:
+            tls_opts = None
+
+        logger.info("Initializing AWS CRT S3 Client")
+        self._tcp_s3_client = s3.S3Client(
+            bootstrap=client_bootstrap,
+            region="us-east-1",
+            credential_provider=self._credentials_provider,
+            enable_s3express=False,
+            tls_connection_options=tls_opts,
+            tls_mode=s3.S3RequestTlsMode.DISABLED,  # non-AWS or custom endpoints
+        )
+
     # Pick the next S3RdmaClient from the pool
     def _get_next_client(self) -> S3RdmaClient:
         """Get next client from pool using round-robin scheduling."""
@@ -236,22 +269,68 @@ class S3RdmaConnector(RemoteConnector):
             result = key_str
         return result
 
-    def _get_object_size_sync(self, s3_key: str) -> Optional[int]:
-        """Get object size using S3 HEAD request (synchronous)."""
-        if s3_key in self._object_size_cache:
-            return self._object_size_cache[s3_key]
+    def _format_safe_path(self, s3_key: str) -> str:
+        """Create a URL-safe path segment for the CRT client."""
+        # Keep the key as-is to preserve '/' in object names
+        path = f"/{s3_key}"
+        return url_quote(path, safe="/")
+
+    def _get_object_size_sync(self, key_str: str) -> int:
+        if key_str in self._object_size_cache:
+            return self._object_size_cache[key_str]
+
+        headers = HttpHeaders()
+
+        # Construct TCP endpoint: bucket.host:port from http://host:port
+        endpoint_stripped = self.settings.endpoint.replace("http://", "").replace("https://", "")
+        tcp_endpoint = f"{self.settings.bucket}.{endpoint_stripped}"
+
+        headers.add("Host", tcp_endpoint)
+        req = HttpRequest("HEAD", self._format_safe_path(key_str), headers)
+
+        got = {"len": None, "status": None, "err": None}
+
+        def on_headers(status_code, headers, **kwargs):
+            got["status"] = status_code
+            for name, value in headers:
+                if name.lower() == "content-length":
+                    try:
+                        got["len"] = int(value)
+                    except Exception:
+                        pass
+
+        def on_done(error=None, **kwargs):
+            got["err"] = error
+
+        s3_req = s3.S3Request(
+            client=self._tcp_s3_client,
+            type=s3.S3RequestType.DEFAULT,
+            request=req,
+            operation_name="HeadObject",
+            on_headers=on_headers,
+            on_done=on_done,
+            credential_provider=self._credentials_provider,
+            region=self.settings.region,
+        )
 
         try:
-            _client = self._get_next_client()
-            size = _client.get_object_size(
-                bucket=self.settings.bucket,
-                key=s3_key
-            )
-            self._object_size_cache[s3_key] = size
-            return size
+            s3_req.finished_future.result()
         except Exception as e:
-            logger.debug("Failed to get size for %s: %s", s3_key, e)
-            return None
+            logger.debug(f"Exception in `_get_object_size`: {e}")
+            return 0
+
+        if got["err"] or got["status"] != 200:
+            logger.warning(
+                "Encountering error in S3 HEAD request "
+                f"with error code: {got['status']}"
+            )
+            return 0
+
+        if got["len"] is not None:
+            self._object_size_cache[key_str] = got["len"]
+            return got["len"]
+
+        return 0
 
     async def exists(self, key: CacheEngineKey) -> bool:
         """Check if key exists in S3."""
@@ -264,17 +343,37 @@ class S3RdmaConnector(RemoteConnector):
     async def _exists(self, key: CacheEngineKey) -> bool:
         """Internal exists implementation."""
         s3_key = self._make_s3_key(key)
-        # Use run_in_executor since HPE client is sync
+
+        start_perf = time.perf_counter_ns()
+
+         # Use run_in_executor since HPE client is sync
         size = await self.loop.run_in_executor(
             None, self._get_object_size_sync, s3_key
         )
-        return size is not None
+
+        end_perf = time.perf_counter_ns()
+        perf_duration = end_perf - start_perf
+        logger.info(
+            "%s S3 HEAD completed in %.6f ms: %s. Size: %s",
+            LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
+
+        return size != 0
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
         """Synchronous version of exists."""
         s3_key = self._make_s3_key(key)
-        result = self._get_object_size_sync(s3_key) is not None
-        return result
+
+        start_perf = time.perf_counter_ns()
+
+        size = self._get_object_size_sync(s3_key)
+
+        end_perf = time.perf_counter_ns()
+        perf_duration = end_perf - start_perf
+        logger.info(
+            "%s S3 HEAD completed in %.6f ms: %s. Size: %s",
+            LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
+
+        return size != 0
 
     def _get_object_sync(self, s3_key: str, memory_obj: MemoryObj) -> bool:
         """Synchronous RDMA GET operation."""
@@ -341,7 +440,7 @@ class S3RdmaConnector(RemoteConnector):
             size = await self.loop.run_in_executor(
                 None, self._get_object_size_sync, s3_key
             )
-            if size is None:
+            if size == 0:
                 return None
 
             # Allocate GPU memory directly for RDMA transfer
@@ -415,8 +514,10 @@ class S3RdmaConnector(RemoteConnector):
             logger.error("Failed to get %s (outer error): %s", s3_key, e, exc_info=True)
             raise
 
-    def _put_object_sync(self, s3_key: str, memory_obj: MemoryObj) -> None:
+    async def _put_background(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         """Synchronous RDMA PUT operation."""
+        s3_key = self._make_s3_key(key)
+
         try:
             buffer_view = memory_obj.byte_array
             _client = self._get_next_client()
@@ -447,28 +548,36 @@ class S3RdmaConnector(RemoteConnector):
         except Exception as e:
             logger.error("Unexpected error during RDMA PUT %s: %s", s3_key, e)
             raise
+        finally:
+            memory_obj.ref_count_down()
+
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        """Put object to S3 using RDMA."""
-        return await self.pq_executor.submit_job(
-            self._put,
-            key=key,
-            memory_obj=memory_obj,
-            priority=Priorities.PUT,
-        )
+        """Put object to S3 using RDMA - fire and forget."""
 
-    # Fire and forget version of _put()
-    async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        """Internal put implementation - fire and forget."""
-        s3_key = self._make_s3_key(key)
+        # Create background task without awaiting
+        task = self.loop.create_task(
+            self._put_background(key, memory_obj)
+            )
 
-        # Fire and forget - no await
-        self.loop.run_in_executor(
-            None,
-            self._put_object_sync,
-            s3_key,
-            memory_obj
-        )
+        # Track task to prevent GC, remove when done
+        self._pending_puts.add(task)
+
+        # Create a future that can be returned
+        future = asyncio.Future()
+
+        def on_complete(t):
+            self._pending_puts.discard(t)
+            try:
+                t.result()  # Propagate exceptions
+                future.set_result(None)
+            except Exception as e:
+                future.set_exception(e)
+
+        task.add_done_callback(on_complete)
+
+        # Return the future so callers can wait if needed
+        return future
 
     async def list(self) -> List[str]:
         """List all objects."""
@@ -481,6 +590,13 @@ class S3RdmaConnector(RemoteConnector):
                 self.pq_executor.shutdown(wait=True)
             except Exception as e:
                 logger.warning("Error shutting down executor: %s", e)
+
+        # Wait for pending puts to complete
+        if self._pending_puts:
+            logger.info(
+                "Waiting for %d pending PUT operations", len(self._pending_puts)
+            )
+            await asyncio.gather(*self._pending_puts, return_exceptions=True)
 
         # Clean up client pool
         self._client_pool.clear()

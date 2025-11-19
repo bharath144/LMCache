@@ -27,11 +27,17 @@ class InstrumentedRemoteConnector(RemoteConnector):
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         obj_size = memory_obj.get_size()
         begin = time.perf_counter()
-        try:
-            await self._connector.put(key, memory_obj)
-        finally:
-            # Ensure reference count is decreased even if exception occurs
-            memory_obj.ref_count_down()
+        
+        # Don't use try/finally here - let the underlying connector handle ref counting
+        await self._connector.put(key, memory_obj)
+        
+        # Reference count is now managed by the background task in the connector
+        
+        # try:
+        #     await self._connector.put(key, memory_obj)
+        # finally:
+        #     # Ensure reference count is decreased even if exception occurs
+        #     memory_obj.ref_count_down()
 
         end = time.perf_counter()
         self._stats_monitor.update_interval_remote_time_to_put((end - begin) * 1000)
