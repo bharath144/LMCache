@@ -220,7 +220,7 @@ class S3RdmaConnector(RemoteConnector):
             "%s S3 RDMA client pool initialized with %d clients",
             LOG_PREFIX, self._client_pool_size)
 
-        self._inflight_sema = asyncio.Semaphore(self._effective_parallelism)
+        self._inflight_sema = asyncio.Semaphore(1000)
         # self._io_executor = AsyncPQThreadPoolExecutor(
         #     self.loop, max_workers=self._effective_parallelism
         # )
@@ -492,19 +492,19 @@ class S3RdmaConnector(RemoteConnector):
             if size == 0:
                 return None
 
-            # Allocate GPU memory directly for RDMA transfer
+            # Allocate CPU memory directly for RDMA transfer
             try:
-                gpu_device = self.local_cpu_backend.dst_device
-                gpu_tensor = torch.empty(
+                #gpu_device = self.local_cpu_backend.dst_device
+                cpu_tensor = torch.empty(
                     size,
                     dtype=torch.uint8,
-                    device=gpu_device)
+                    device=self.local_cpu_backend.dst_device)
 
                 # Create metadata for the MemoryObj
                 metadata = MemoryObjMetadata(
                     shape=self.meta_shape,
                     dtype=self.meta_dtype,
-                    address=gpu_tensor.data_ptr(),
+                    address=cpu_tensor.data_ptr(),
                     phy_size=size,
                     ref_count=1,
                     pin_count=0,
@@ -513,7 +513,7 @@ class S3RdmaConnector(RemoteConnector):
 
                 # Create TensorMemoryObj wrapping the GPU tensor
                 memory_obj = TensorMemoryObj(
-                    raw_data=gpu_tensor,
+                    raw_data=cpu_tensor,
                     metadata=metadata,
                     parent_allocator=None
                 )
@@ -552,7 +552,7 @@ class S3RdmaConnector(RemoteConnector):
                     # Clean up on failure
                     memory_obj.invalidate()
                     del memory_obj
-                    del gpu_tensor
+                    del cpu_tensor
                     return None
 
                 return memory_obj
