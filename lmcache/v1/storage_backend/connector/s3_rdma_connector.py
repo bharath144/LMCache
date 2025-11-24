@@ -392,18 +392,18 @@ class S3RdmaConnector(RemoteConnector):
         """Internal exists implementation."""
         s3_key = self._make_s3_key(key)
 
-        start_perf = time.perf_counter_ns()
+        # start_perf = time.perf_counter_ns()
 
          # Use run_in_executor since HPE client is sync
         size = await self.loop.run_in_executor(
             None, self._get_object_size_sync, s3_key
         )
 
-        end_perf = time.perf_counter_ns()
-        perf_duration = end_perf - start_perf
-        logger.info(
-            "%s S3 HEAD completed in %.6f ms: %s. Size: %s",
-            LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
+        # end_perf = time.perf_counter_ns()
+        # perf_duration = end_perf - start_perf
+        # logger.info(
+        #     "%s S3 HEAD completed in %.6f ms: %s. Size: %s",
+        #     LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
 
         return size != 0
 
@@ -411,15 +411,15 @@ class S3RdmaConnector(RemoteConnector):
         """Synchronous version of exists."""
         s3_key = self._make_s3_key(key)
 
-        start_perf = time.perf_counter_ns()
+        # start_perf = time.perf_counter_ns()
 
         size = self._get_object_size_sync(s3_key)
 
-        end_perf = time.perf_counter_ns()
-        perf_duration = end_perf - start_perf
-        logger.info(
-            "%s S3 HEAD completed in %.6f ms: %s. Size: %s",
-            LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
+        # end_perf = time.perf_counter_ns()
+        # perf_duration = end_perf - start_perf
+        # logger.info(
+        #     "%s S3 HEAD completed in %.6f ms: %s. Size: %s",
+        #     LOG_PREFIX, perf_duration / 1_000_000, s3_key, size)
 
         return size != 0
 
@@ -441,7 +441,7 @@ class S3RdmaConnector(RemoteConnector):
             next_client = self._get_next_client()
             assert next_client is not None
 
-            start_perf = time.perf_counter_ns()
+            # start_perf = time.perf_counter_ns()
             next_client.get_object_buffers(
                 BufferGetObject(
                     bucket=self.settings.bucket,
@@ -449,11 +449,11 @@ class S3RdmaConnector(RemoteConnector):
                     buffer=memoryview(buffer)
                     )
             )
-            end_perf = time.perf_counter_ns()
-            perf_duration = end_perf - start_perf
-            logger.info(
-                "%s RDMA GET completed in %.6f ms: %s. Transfer size: %s",
-                LOG_PREFIX, perf_duration / 1_000_000, s3_key, storage_size)
+            # end_perf = time.perf_counter_ns()
+            # perf_duration = end_perf - start_perf
+            # logger.info(
+            #     "%s RDMA GET completed in %.6f ms: %s. Transfer size: %s",
+            #     LOG_PREFIX, perf_duration / 1_000_000, s3_key, storage_size)
 
             return True
 
@@ -570,7 +570,7 @@ class S3RdmaConnector(RemoteConnector):
             _client = self._get_next_client()
             assert _client is not None
 
-            _start = time.perf_counter_ns()
+            # _start = time.perf_counter_ns()
             _client.put_object_buffers(
                 BufferPutObject(
                     bucket=self.settings.bucket,
@@ -578,13 +578,13 @@ class S3RdmaConnector(RemoteConnector):
                     buffer=buffer_view
                 )
             )
-            _end = time.perf_counter_ns()
-            _duration_ms = _end - _start
-            logger.info(
-                "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
-                LOG_PREFIX, _duration_ms / 1_000_000,
-                s3_key,
-                len(buffer_view))
+            # _end = time.perf_counter_ns()
+            # _duration_ms = _end - _start
+            # logger.info(
+            #     "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
+            #     LOG_PREFIX, _duration_ms / 1_000_000,
+            #     s3_key,
+            #     len(buffer_view))
 
             # Cache the size
             self._object_size_cache[s3_key] = len(buffer_view)
@@ -643,7 +643,7 @@ class S3RdmaConnector(RemoteConnector):
             size_bytes = memory_obj.get_physical_size()
 
             # Start of perf measurement
-            start_perf = time.perf_counter_ns()
+            # start_perf = time.perf_counter_ns()
 
             # Ephemeral /dev/shm staging file
             send_tmp = tempfile.NamedTemporaryFile(
@@ -664,21 +664,21 @@ class S3RdmaConnector(RemoteConnector):
             await asyncio.wrap_future(s3_req.finished_future)
 
             # End of perf measurement
-            end_perf = time.perf_counter_ns()
+            # end_perf = time.perf_counter_ns()
 
-            perf_duration = end_perf - start_perf
+            # perf_duration = end_perf - start_perf
 
             # Update object size cache (mirroring TCP behavior)
             self._object_size_cache[s3_key] = size_bytes
 
             # Summary log line (mirrors TCP wording with RDMA prefix)
-            logger.info(
-                "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
-                LOG_PREFIX,
-                perf_duration / 1_000_000,
-                s3_key,
-                size_bytes,
-            )
+            # logger.info(
+            #     "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
+            #     LOG_PREFIX,
+            #     perf_duration / 1_000_000,
+            #     s3_key,
+            #     size_bytes,
+            # )
 
         except Exception as e:
             logger.error("Failed TCP-like PUT for %s: %s", s3_key, e)
