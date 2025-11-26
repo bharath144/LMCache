@@ -479,6 +479,14 @@ class S3Connector(RemoteConnector):
         return s3_req
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
+        """Get object from S3 using RDMA."""
+        return await self.pq_executor.submit_job(
+            self._get,
+            key=key,
+            priority=Priorities.GET,
+        )
+
+    async def _get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         key_str = key.to_string()
 
         obj_size = self.object_size_cache.get(key_str, None)
@@ -503,61 +511,150 @@ class S3Connector(RemoteConnector):
             "Saving unfull chunk is not supported in S3Connector."
         )
 
-        # TODO(Jiayi): Need to support offset to enable zero-copy
-        # We probably need to get the shared memory offset directly from memory object.
-        recv_path, shm, mm = self.adhoc_shm_manager.allocate()
+        recv, shm, mm = self.adhoc_shm_manager.allocate()
         src_view = memoryview(mm)
 
-        #start_perf = time.perf_counter_ns()
-        # s3_req = self._s3_download(
-        #     key_str=key_str,
-        #     recv_path=recv_path,
-        # )
-        # await asyncio.wrap_future(s3_req.finished_future)
-        #next_client = await self._get_next_client()
-        #assert next_client is not None
-
-        # Lockless client selection using consistent hashing
-        next_client = self._client_pool[hash(key_str) % self._client_pool_size]
-
-        # The keys are stored with '/' replaced by '_'
-        # We'll need the same format while retrieving
-        flat_key_str = key_str.replace("/", "_")
-
-        buffer_get_object_instance = BufferGetObject(
+        object_buffer = BufferGetObject(
             bucket=self.s3_bucket_name,
-            key=flat_key_str,
+            key=key_str.replace("/", "_"),
             buffer=src_view
         )
 
-        # Wrap synchronous RDMA call in executor to properly await it
-        await self.loop.run_in_executor(
-            None,
-            next_client.get_object_buffers,
-            buffer_get_object_instance
-        )
+        result = await self.loop.run_in_executor(
+            None, self._get_objects_sync, [key_str], [object_buffer])
 
-        dst_ptr = memory_obj.data_ptr
+        if result:
+            dst_ptr = memory_obj.data_ptr
 
-        # Cast the memoryview into a ctypes array type (e.g., an array of bytes)
-        # This makes it compatible with ctypes' internal pointer logic
-        c_source_buffer = (ctypes.c_ubyte * obj_size).from_buffer(src_view)
+            # Cast the memoryview into a ctypes array type
+            # (e.g., an array of bytes)
+            # This makes it compatible with ctypes' internal pointer logic
+            c_source_buffer = (ctypes.c_ubyte * obj_size).from_buffer(src_view)
 
-        # Get the address of that ctypes buffer object
-        source_address = ctypes.addressof(c_source_buffer)
-        ctypes.memmove(dst_ptr, source_address, obj_size)
+            # Get the address of that ctypes buffer object
+            source_address = ctypes.addressof(c_source_buffer)
+            ctypes.memmove(dst_ptr, source_address, obj_size)
+        else:
+            memory_obj.invalidate()
+            del memory_obj
+            memory_obj = None
 
-        #end_perf = time.perf_counter_ns()
-        #perf_duration = end_perf - start_perf
-        # logger.info(
-        #     "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
-        #     LOG_PREFIX, perf_duration / 1_000_000, key_str, obj_size)
-
-        self.adhoc_shm_manager.free(recv_path, shm, mm)
-
-        #self.inflight_sema.release()
+        # Final cleanup, irrespectie of pass or failure
+        self.adhoc_shm_manager.free(recv, shm, mm)
 
         return memory_obj
+
+    def _get_objects_sync(
+        self,
+        keys: List[str],
+        object_buffers: List[BufferGetObject],
+    ) -> bool:
+        """
+        Synchronous part of get operation using RDMA.
+        """
+        # TODO: Need better handling of errors and partial failures
+
+        # object_buffers: List[BufferGetObject] = []
+
+        # logger.info("%s Starting RDMA GET for %d objects",
+        #             LOG_PREFIX, len(memory_objs))
+
+        # for key, memory_obj in zip(keys, memory_objs):
+        #     logger.info("%s Creating Buffer for key %s and MemoryObj %s",
+        #                 LOG_PREFIX, key, memory_obj)
+        #     if memory_obj is None:
+        #         continue
+
+        #     obj_size = self.object_size_cache[key]
+        #     storage = memory_obj.tensor.untyped_storage()
+        #     storage_ptr = storage.data_ptr()
+        #     buffer = (ctypes.c_ubyte * obj_size).from_address(storage_ptr)
+
+        #     # Construct object buffers for RDMA read and append to a list
+        #     safe_key = key.replace("/", "_")
+        #     object_buffer = BufferGetObject(
+        #         bucket=self.s3_bucket_name,
+        #         key=safe_key,
+        #         buffer=memoryview(buffer)
+        #     )
+        #     object_buffers.append(object_buffer)
+
+        # logger.info("%s Prepared %d object buffers for RDMA GET",
+        #             LOG_PREFIX, len(object_buffers))
+
+        try:
+            # obj_size = self.object_size_cache[key_str]
+            # # TODO(Jiayi): Need to support offset to enable zero-copy
+            # # We probably need to get the shared memory offset directly from memory object.
+            # # recv_path, shm, mm = self.adhoc_shm_manager.allocate()
+            # # src_view = memoryview(mm)
+            # assert memory_obj.tensor is not None
+            # storage = memory_obj.tensor.untyped_storage()
+            # storage_ptr = storage.data_ptr()
+            # #storage_size = storage.nbytes()
+            # buffer = (ctypes.c_ubyte * obj_size).from_address(storage_ptr)
+
+
+            #start_perf = time.perf_counter_ns()
+            # s3_req = self._s3_download(
+            #     key_str=key_str,
+            #     recv_path=recv_path,
+            # )
+            # await asyncio.wrap_future(s3_req.finished_future)
+            #next_client = await self._get_next_client()
+            #assert next_client is not None
+
+            # Lockless client selection using consistent hashing
+
+            # The keys are stored with '/' replaced by '_'
+            # We'll need the same format while retrieving
+            # flat_key_str = key_str.replace("/", "_")
+
+            # _object = BufferGetObject(
+            #     bucket=self.s3_bucket_name,
+            #     key=flat_key_str,
+            #     buffer=memoryview(buffer)
+            # )
+
+            next_client = \
+                self._client_pool[hash(keys[0]) % self._client_pool_size]
+
+            # RDMA read into shared memory buffer
+            next_client.get_object_buffers(object_buffers)
+
+            # dst_ptr = memory_obj.data_ptr
+
+            # Cast the memoryview into a ctypes array type (e.g., an array of bytes)
+            # This makes it compatible with ctypes' internal pointer logic
+            # c_source_buffer = (ctypes.c_ubyte * obj_size).from_buffer(src_view)
+
+            # Get the address of that ctypes buffer object
+            # source_address = ctypes.addressof(c_source_buffer)
+            # ctypes.memmove(dst_ptr, source_address, obj_size)
+
+            #end_perf = time.perf_counter_ns()
+            #perf_duration = end_perf - start_perf
+            # logger.info(
+            #     "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
+            #     LOG_PREFIX, perf_duration / 1_000_000, key_str, obj_size)
+
+            # self.adhoc_shm_manager.free(recv_path, shm, mm)
+
+            #self.inflight_sema.release()
+
+            return True
+        except RuntimeError as e:
+            # hpe_object raises RuntimeError for various errors
+            error_str = str(e).lower()
+            if "not found" in error_str or "404" in error_str or "nosuchkey" in error_str:
+                logger.info("Object not found: %s", error_str)
+                return False
+            else:
+                logger.error("RDMA GET error for %s: %s", keys[0], e)
+                raise
+        except Exception as e:
+            logger.error(f"Unexpected error during get of {keys[0]} from S3: {e}")
+            raise
 
     # this callback allows us to safely have multiple calls to batched_get
     # since we release the semaphores 1-by-1
@@ -595,32 +692,48 @@ class S3Connector(RemoteConnector):
     async def batched_get(
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
-        memory_objs: List[Optional[MemoryObj]] = []
-        buffer_get_objects: List[BufferGetObject] = []
+        """Batched get implementation for RDMA"""
+        logger.info("%s Starting batched GET for %d objects",
+                    LOG_PREFIX, len(keys))
+
+        return await self.pq_executor.submit_job(
+            self._batched_get,
+            keys=keys,
+            priority=Priorities.GET,
+        )
+
+    async def _batched_get(
+        self, keys: List[CacheEngineKey]
+    ) -> List[Optional[MemoryObj]]:
+        """Internal implementation of batched get for RDMA"""
+
+        logger.info("%s Starting _batched GET for %d objects",
+                    LOG_PREFIX, len(keys))
+
+        memory_objs: Optional[List[MemoryObj]] = []
+        keys_list: List[str] = []
+        buffer_objects: List[BufferGetObject] = []
         resources: List[tuple[str, int, mmap.mmap, memoryview]] = []
 
-        # It is okay for len(keys) > self.s3_max_inflight_reqs
-        # but it will be slower.
-        if len(keys) > self.s3_max_inflight_reqs:
-            logger.warning(
-                f"More keys {len(keys)} to get than "
-                f"max inflight requests {self.s3_max_inflight_reqs}."
-                "This will cause slower retrieval."
-            )
-
-        # Prepare all buffer objects and allocate resources
+        # Prepare all MemoryObjects and allocate resources
         for key in keys:
             key_str = key.to_string()
 
+            # First check if we have cached object size
             obj_size = self.object_size_cache.get(key_str, None)
 
+            # If we don't have the size cached, make a HEAD_OBJECT call
             if obj_size is None:
                 obj_size = await self._get_object_size_async(key_str)
                 if obj_size <= 0:
+                    # Unlikely, this means that the external cache has evicted
+                    # the object. Moving onto the next key in the list is the
+                    # only option.
                     self.object_size_cache[key_str] = 0
-                    memory_objs.append(None)
                     continue
                 self.object_size_cache[key_str] = obj_size
+
+            keys_list.append(key_str)
 
             memory_obj = self.local_cpu_backend.allocate(
                 self.meta_shape,
@@ -628,55 +741,43 @@ class S3Connector(RemoteConnector):
                 self.meta_fmt,
             )
 
+            # Append to the list of memory objects
             memory_objs.append(memory_obj)
 
             if not memory_obj:
                 continue
 
-            # TODO(Jiayi): Please support this
-            assert obj_size == memory_obj.get_size(), (
-                "Saving unfull chunk is not supported in S3Connector."
-            )
-
             # Allocate shared memory buffer
-            recv_path, shm, mm = self.adhoc_shm_manager.allocate()
+            recv, shm, mm = self.adhoc_shm_manager.allocate()
             src_view = memoryview(mm)
 
             # Store resources for cleanup later
-            resources.append((recv_path, shm, mm, src_view))
+            resources.append((recv, shm, mm, src_view))
 
             # The keys are stored with '/' replaced by '_'
-            flat_key_str = key_str.replace("/", "_")
+            safe_key = key_str.replace("/", "_")
 
-            buffer_get_object_instance = BufferGetObject(
-                bucket=self.s3_bucket_name,
-                key=flat_key_str,
-                buffer=src_view
-            )
+            buffer_object = BufferGetObject(
+                bucket=self.s3_bucket_name, key=safe_key, buffer=src_view)
 
-            buffer_get_objects.append(buffer_get_object_instance)
+            buffer_objects.append(buffer_object)
 
-        # Perform batched RDMA read if we have any valid objects
-        if buffer_get_objects:
-            # Select client using consistent hashing based on first key
-            next_client = self._client_pool[hash(keys[0].to_string()) % self._client_pool_size]
+        if buffer_objects:
+            # Now we are ready to call synchronous get on all the objects
+            status = await self.loop.run_in_executor(
+                None, self._get_objects_sync, keys_list, buffer_objects)
 
-            logger.info(
-                "%s Starting RDMA Batched GET", LOG_PREFIX)
-
-            start_perf = time.perf_counter_ns()
-            # Wrap synchronous RDMA call in executor to properly await it
-            await self.loop.run_in_executor(
-                None,
-                next_client.get_object_buffers,
-                buffer_get_objects
-            )
-            perf_duration = time.perf_counter_ns() - start_perf
-            logger.info(
-                "%s RDMA Batched GET completed in %.6f ms: %d objects.",
-                LOG_PREFIX, perf_duration / 1_000_000,
-                len(buffer_get_objects)
-            )
+            if not status:
+                # Unlikely situation, just logging a message here for now.
+                # Better error handling needs to be implemented.
+                # TODO: Implement better error handling for batched_get
+                logger.warning(
+                    "%s Batched GET encountered errors. Some objects may be "
+                    "missing.", LOG_PREFIX)
+            else:
+                logger.info(
+                    "%s Batched GET succeeded for %d objects.",
+                    LOG_PREFIX, len(keys_list))
 
             # Copy data from shared memory buffers to memory objects
             resource_idx = 0
@@ -684,22 +785,57 @@ class S3Connector(RemoteConnector):
                 if memory_obj is None:
                     continue
 
-                recv_path, shm, mm, src_view = resources[resource_idx]
+                recv, shm, mm, src_view = resources[resource_idx]
                 key_str = keys[i].to_string()
                 obj_size = self.object_size_cache[key_str]
 
                 dst_ptr = memory_obj.data_ptr
 
                 # Cast the memoryview into a ctypes array type
-                c_source_buffer = (ctypes.c_ubyte * obj_size).from_buffer(src_view)
-                source_address = ctypes.addressof(c_source_buffer)
-                ctypes.memmove(dst_ptr, source_address, obj_size)
+                source_bfr = (ctypes.c_ubyte * obj_size).from_buffer(src_view)
+                source_addr = ctypes.addressof(source_bfr)
+                ctypes.memmove(dst_ptr, source_addr, obj_size)
 
                 # Free shared memory buffer
-                self.adhoc_shm_manager.free(recv_path, shm, mm)
+                self.adhoc_shm_manager.free(recv, shm, mm)
 
                 resource_idx += 1
 
+
+        # DEBUG: Check for overlapping memory regions
+        # ptrs = set()
+        # for i, obj in enumerate(memory_objs):
+        #     if obj is not None:
+        #         ptr = obj.tensor.untyped_storage().data_ptr()
+        #         if ptr in ptrs:
+        #             logger.error(
+        #                 "%s Memory overlap detected! Object %d shares pointer with another object",
+        #                 LOG_PREFIX, i
+        #             )
+        #         ptrs.add(ptr)
+        #         logger.info("%s Object %d ptr: %x", LOG_PREFIX, i, ptr)
+
+        # logger.info("%s Prepared %d MemoryObjs for batched GET",
+                    # LOG_PREFIX, len(memory_objs))
+
+        # Now we are ready to call synchronous get on all the objects
+        # status = await self.loop.run_in_executor(
+        #     None, self._get_objects_sync, keys_list, memory_objs)
+
+        # if not status:
+        #     # Unlikely situation, just logging a message here for now.
+        #     # Better error handling needs to be implemented.
+        #     # TODO: Implement better error handling for batched_get
+        #     logger.warning(
+        #         "%s Batched GET encountered errors. Some objects may be "
+        #         "missing.", LOG_PREFIX)
+        # else:
+        #     logger.info(
+        #         "%s Batched GET succeeded for %d objects.",
+        #         LOG_PREFIX, len(keys_list))
+
+        # Finally return the list of memory objects. At this point
+        # some or all or none of them have the data retrieved from the bucket.
         return memory_objs
 
     def _s3_upload(
@@ -820,7 +956,7 @@ class S3Connector(RemoteConnector):
         )
 
     def support_batched_get_non_blocking(self) -> bool:
-        return True
+        return False
 
     async def _batched_get_non_blocking(
         self,
@@ -852,7 +988,7 @@ class S3Connector(RemoteConnector):
         raise NotImplementedError
 
     def support_batched_get(self) -> bool:
-        return True
+        return False
 
     async def close(self):
         await self.pq_executor.shutdown(wait=True)
