@@ -380,16 +380,16 @@ class S3RdmaConnector(RemoteConnector):
         object_buffer = BufferGetObject(
             bucket=self.settings.bucket, key=key_str, buffer=src_mview)
 
-        start_perf = time.perf_counter_ns()
+        # start_perf = time.perf_counter_ns()
 
         result = await self.loop.run_in_executor(
             None, self._get_objects_sync, [key_str], [object_buffer])
 
-        end_perf = time.perf_counter_ns()
-        perf_duration = end_perf - start_perf
-        logger.info(
-            "%s RDMA GET (individual) completed in %.6f ms: %s",
-            LOG_PREFIX, perf_duration / 1_000_000, key_str)
+        # end_perf = time.perf_counter_ns()
+        # perf_duration = end_perf - start_perf
+        # logger.info(
+        #     "%s RDMA GET (individual) completed in %.6f ms: %s",
+        #     LOG_PREFIX, perf_duration / 1_000_000, key_str)
 
         if result:
             # Copy data from shared memory buffer to memory object
@@ -416,7 +416,7 @@ class S3RdmaConnector(RemoteConnector):
         return await self.pq_executor.submit_job(
             self._batched_get,
             keys=keys,
-            priority=Priorities.GET,
+            priority=Priorities.PREFETCH,
         )
 
     async def _batched_get(
@@ -474,18 +474,18 @@ class S3RdmaConnector(RemoteConnector):
             buffer_objects.append(buffer_object)
 
         if buffer_objects:
-            start_perf = time.perf_counter_ns()
+            # start_perf = time.perf_counter_ns()
 
             # Now we are ready to call synchronous get on all the objects
             status = await self.loop.run_in_executor(
                 None, self._get_objects_sync, keys_list, buffer_objects)
 
-            end_perf = time.perf_counter_ns()
-            perf_duration = end_perf - start_perf
-            logger.info(
-                "%s RDMA GET (batched) completed in %.6f ms for %d objects",
-                LOG_PREFIX, perf_duration / 1_000_000,
-                len(buffer_objects))
+            # end_perf = time.perf_counter_ns()
+            # perf_duration = end_perf - start_perf
+            # logger.info(
+            #     "%s RDMA GET (batched) completed in %.6f ms for %d objects",
+            #     LOG_PREFIX, perf_duration / 1_000_000,
+            #     len(buffer_objects))
 
             if not status:
                 # Unlikely situation, just logging a message here for now.
@@ -569,7 +569,7 @@ class S3RdmaConnector(RemoteConnector):
             buffer_view = memory_obj.byte_array
             client = self.client_pool[hash(s3_key) % self.client_pool_size]
 
-            start_perf = time.perf_counter_ns()
+            # start_perf = time.perf_counter_ns()
             client.put_object_buffers(
                 BufferPutObject(
                     bucket=self.settings.bucket,
@@ -577,13 +577,13 @@ class S3RdmaConnector(RemoteConnector):
                     buffer=buffer_view
                 )
             )
-            end_perf = time.perf_counter_ns()
-            perf_duration = end_perf - start_perf
-            logger.info(
-                "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
-                LOG_PREFIX, perf_duration / 1_000_000,
-                s3_key,
-                len(buffer_view))
+            # end_perf = time.perf_counter_ns()
+            # perf_duration = end_perf - start_perf
+            # logger.info(
+            #     "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
+            #     LOG_PREFIX, perf_duration / 1_000_000,
+            #     s3_key,
+            #     len(buffer_view))
 
             # Cache the size
             self.object_size_cache[s3_key] = len(buffer_view)
@@ -594,6 +594,62 @@ class S3RdmaConnector(RemoteConnector):
         except Exception as e:
             logger.error("Unexpected error during RDMA PUT %s: %s", s3_key, e)
             raise
+
+    async def batched_put(
+        self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
+    ) -> None:
+        """Batched get implementation for RDMA"""
+        return await self.pq_executor.submit_job(
+            self._batched_put,
+            keys=keys,
+            memory_objs=memory_objs,
+            priority=Priorities.PUT,
+        )
+
+    async def _batched_put(
+        self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
+    ) -> None:
+        """Internal implementation of batched put for RDMA"""
+
+        buffer_objects: List[BufferPutObject] = []
+        keys_list: List[str] = []
+
+        for key, memory_obj in zip(keys, memory_objs):
+            s3_key = self._make_s3_key(key)
+            keys_list.append(s3_key)
+
+            buffer_view = memory_obj.byte_array
+
+            buffer_object = BufferPutObject(
+                bucket=self.settings.bucket, key=s3_key, buffer=buffer_view)
+
+            buffer_objects.append(buffer_object)
+
+        try:
+            client = \
+                self.client_pool[hash(keys_list[0]) % self.client_pool_size]
+
+            # start_perf = time.perf_counter_ns()
+
+            client.put_object_buffers(buffer_objects)
+
+            # end_perf = time.perf_counter_ns()
+            # perf_duration = end_perf - start_perf
+            # logger.info(
+            #     "%s RDMA PUT (batched) completed in %.6f ms for %d objects",
+            #     LOG_PREFIX, perf_duration / 1_000_000,
+            #     len(buffer_objects))
+        except RuntimeError as e:
+            logger.error("RDMA PUT error for %s: %s", keys_list[0], str(e))
+            raise
+        except Exception as e:
+            logger.error("Unexpected error during RDMA PUT %s: %s",
+                         keys_list[0], e)
+            raise
+
+        # Cache the sizes for future reference
+        for key, memory_obj in zip(keys_list, memory_objs):
+            self.object_size_cache[key] = len(memory_obj.byte_array)
 
     def support_batched_async_contains(self) -> bool:
         return False
@@ -609,6 +665,9 @@ class S3RdmaConnector(RemoteConnector):
         return False
 
     def support_batched_get(self) -> bool:
+        return True
+
+    def support_batched_put(self) -> bool:
         return True
 
     async def close(self) -> None:
