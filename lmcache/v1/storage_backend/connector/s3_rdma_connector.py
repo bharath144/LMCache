@@ -292,23 +292,6 @@ class S3RdmaConnector(RemoteConnector):
             result = key_str
         return result
 
-    def _get_object_size_sync(self, s3_key: str) -> int:
-        """Get object size using S3 HEAD request (synchronous)."""
-        if s3_key in self.object_size_cache:
-            return self.object_size_cache[s3_key]
-
-        try:
-            client = self.client_pool[hash(s3_key) % self.client_pool_size]
-            size = client.get_object_size(
-                bucket=self.settings.bucket,
-                key=s3_key
-            )
-            self.object_size_cache[s3_key] = size
-            return size
-        except Exception as e:
-            logger.warning("Failed to get size for %s: %s", s3_key, e)
-            return 0
-
     async def exists(self, key: CacheEngineKey) -> bool:
         """Check if key exists in S3."""
         return await self.pq_executor.submit_job(
@@ -320,17 +303,38 @@ class S3RdmaConnector(RemoteConnector):
     async def _exists(self, key: CacheEngineKey) -> bool:
         """Internal exists implementation."""
         s3_key = self._make_s3_key(key)
+
         # Use run_in_executor since HPE client is sync
         size = await self.loop.run_in_executor(
             None, self._get_object_size_sync, s3_key
         )
-        return size is not None
+        return size != 0
 
     def exists_sync(self, key: CacheEngineKey) -> bool:
         """Synchronous version of exists."""
         s3_key = self._make_s3_key(key)
-        result = self._get_object_size_sync(s3_key) is not None
-        return result
+
+        size = self._get_object_size_sync(s3_key)
+
+        return size != 0
+
+    def _get_object_size_sync(self, s3_key: str) -> int:
+        """Get object size using S3 HEAD request (synchronous)."""
+        if s3_key in self.object_size_cache:
+            size = self.object_size_cache[s3_key]
+        else:
+            try:
+                client = self.client_pool[hash(s3_key) % self.client_pool_size]
+                size = client.get_object_size(
+                    bucket=self.settings.bucket,
+                    key=s3_key
+                )
+                self.object_size_cache[s3_key] = size
+            except Exception as e:
+                logger.debug("Failed to get size for %s: %s", s3_key, e)
+                size = 0
+
+        return size
 
     async def get(self, key: CacheEngineKey) -> Optional[MemoryObj]:
         """Get object from S3 using RDMA."""
@@ -362,21 +366,46 @@ class S3RdmaConnector(RemoteConnector):
             self.meta_fmt,
         )
 
-        storage = memory_obj.tensor.untyped_storage()
-        storage_ptr = storage.data_ptr()
-        buffer = (ctypes.c_ubyte * obj_size).from_address(storage_ptr)
+        # storage = memory_obj.tensor.untyped_storage()
+        # storage_ptr = storage.data_ptr()
+        # buffer = (ctypes.c_ubyte * obj_size).from_address(storage_ptr)
+
+        # object_buffer = BufferGetObject(
+        #     bucket=self.settings.bucket, key=key_str,
+        #     buffer=memoryview(buffer))
+
+        recv, shm, mm = self.adhoc_shm_manager.allocate()
+        src_mview = memoryview(mm)
 
         object_buffer = BufferGetObject(
-            bucket=self.settings.bucket, key=key_str,
-            buffer=memoryview(buffer))
+            bucket=self.settings.bucket, key=key_str, buffer=src_mview)
+
+        start_perf = time.perf_counter_ns()
 
         result = await self.loop.run_in_executor(
             None, self._get_objects_sync, [key_str], [object_buffer])
 
-        if not result:
+        end_perf = time.perf_counter_ns()
+        perf_duration = end_perf - start_perf
+        logger.info(
+            "%s RDMA GET (individual) completed in %.6f ms: %s",
+            LOG_PREFIX, perf_duration / 1_000_000, key_str)
+
+        if result:
+            # Copy data from shared memory buffer to memory object
+            dst_ptr = memory_obj.data_ptr
+
+            # Cast the memoryview into a ctypes array type
+            source_bfr = (ctypes.c_ubyte * obj_size).from_buffer(src_mview)
+            source_addr = ctypes.addressof(source_bfr)
+            ctypes.memmove(dst_ptr, source_addr, obj_size)
+        else:
             memory_obj.invalidate()
             del memory_obj
             memory_obj = None
+
+        # Final cleanup, irrespective of success or failure
+        self.adhoc_shm_manager.free(recv, shm, mm)
 
         return memory_obj
 
@@ -384,9 +413,6 @@ class S3RdmaConnector(RemoteConnector):
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
         """Batched get implementation for RDMA"""
-        logger.info("%s Starting batched GET for %d objects",
-                    LOG_PREFIX, len(keys))
-
         return await self.pq_executor.submit_job(
             self._batched_get,
             keys=keys,
@@ -398,10 +424,7 @@ class S3RdmaConnector(RemoteConnector):
     ) -> List[Optional[MemoryObj]]:
         """Internal implementation of batched get for RDMA"""
 
-        logger.info("%s Starting _batched GET for %d objects",
-                    LOG_PREFIX, len(keys))
-
-        memory_objs: Optional[List[MemoryObj]] = []
+        memory_objs: List[Optional[MemoryObj]] = []
         keys_list: List[str] = []
         buffer_objects: List[BufferGetObject] = []
         resources: List[tuple[str, int, mmap.mmap, memoryview]] = []
@@ -451,9 +474,18 @@ class S3RdmaConnector(RemoteConnector):
             buffer_objects.append(buffer_object)
 
         if buffer_objects:
+            start_perf = time.perf_counter_ns()
+
             # Now we are ready to call synchronous get on all the objects
             status = await self.loop.run_in_executor(
                 None, self._get_objects_sync, keys_list, buffer_objects)
+
+            end_perf = time.perf_counter_ns()
+            perf_duration = end_perf - start_perf
+            logger.info(
+                "%s RDMA GET (batched) completed in %.6f ms for %d objects",
+                LOG_PREFIX, perf_duration / 1_000_000,
+                len(buffer_objects))
 
             if not status:
                 # Unlikely situation, just logging a message here for now.
@@ -462,10 +494,6 @@ class S3RdmaConnector(RemoteConnector):
                 logger.warning(
                     "%s Batched GET encountered errors. Some objects may be "
                     "missing.", LOG_PREFIX)
-            else:
-                logger.info(
-                    "%s Batched GET succeeded for %d objects.",
-                    LOG_PREFIX, len(keys_list))
 
             # Copy data from shared memory buffers to memory objects
             resource_idx = 0
@@ -534,24 +562,14 @@ class S3RdmaConnector(RemoteConnector):
 
     # Fire and forget version of _put()
     async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        """Internal put implementation - fire and forget."""
+        """Internal put implementation"""
         s3_key = self._make_s3_key(key)
 
-        # Fire and forget - no await
-        self.loop.run_in_executor(
-            None,
-            self._put_object_sync,
-            s3_key,
-            memory_obj
-        )
-
-    def _put_object_sync(self, s3_key: str, memory_obj: MemoryObj) -> None:
-        """Synchronous RDMA PUT operation."""
         try:
             buffer_view = memory_obj.byte_array
             client = self.client_pool[hash(s3_key) % self.client_pool_size]
 
-            _start = time.perf_counter_ns()
+            start_perf = time.perf_counter_ns()
             client.put_object_buffers(
                 BufferPutObject(
                     bucket=self.settings.bucket,
@@ -559,11 +577,11 @@ class S3RdmaConnector(RemoteConnector):
                     buffer=buffer_view
                 )
             )
-            _end = time.perf_counter_ns()
-            _duration_ms = _end - _start
+            end_perf = time.perf_counter_ns()
+            perf_duration = end_perf - start_perf
             logger.info(
                 "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
-                LOG_PREFIX, _duration_ms / 1_000_000,
+                LOG_PREFIX, perf_duration / 1_000_000,
                 s3_key,
                 len(buffer_view))
 
@@ -595,6 +613,8 @@ class S3RdmaConnector(RemoteConnector):
 
     async def close(self) -> None:
         """Clean up resources."""
+        logger.info("%s Closing S3 RDMA connector", LOG_PREFIX)
+
         if self.pq_executor:
             try:
                 self.pq_executor.shutdown(wait=True)
