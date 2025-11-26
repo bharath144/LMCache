@@ -2,6 +2,8 @@
 # Standard
 from enum import IntEnum, auto
 from functools import partial
+from itertools import cycle
+#from threading import Lock
 from typing import List, Optional
 from urllib.parse import quote as url_quote
 import asyncio
@@ -15,6 +17,66 @@ import time
 from awscrt import auth, io, s3
 from awscrt.http import HttpHeaders, HttpRequest
 from awscrt.io import ClientTlsContext, TlsConnectionOptions, TlsContextOptions
+
+# CRITICAL: Must load HPE's cuFile library BEFORE any code imports hpe_object
+# This must happen at module import time, not later
+_HPE_CUFILE_LOADED = False
+_HPE_OBJECT_AVAILABLE = False
+_HPE_OBJECT_IMPORT_ERROR = None
+
+def _preload_hpe_cufile():
+    """Pre-load HPE's cuFile library to ensure correct version is used."""
+    global _HPE_CUFILE_LOADED
+
+    if _HPE_CUFILE_LOADED:
+        return True
+
+    hpe_cufile_paths = [
+        "/opt/hpe/s3/lib64/libcufile.so.1.13.0",
+        "/opt/hpe/s3/lib64/libcufile.so",
+    ]
+
+    for path in hpe_cufile_paths:
+        if not os.path.exists(path):
+            continue
+
+        try:
+            # Load with RTLD_GLOBAL to make symbols available globally
+            lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+
+            # Verify the required symbol exists
+            try:
+                _ = lib._ZN10cuFileInfo19cuFileGetMemoryTypeEPKv
+                _HPE_CUFILE_LOADED = True
+                return True
+            except AttributeError:
+                # Wrong version, try next
+                continue
+
+        except Exception:
+            continue
+
+    return False
+
+# Pre-load HPE cuFile library FIRST
+_cufile_loaded = _preload_hpe_cufile()
+
+# Now try to import hpe_object
+try:
+    # Third Party
+    from hpe_object import (
+        BufferGetObject,
+        ClientConfig,
+        S3RdmaClient,
+    )
+    _HPE_OBJECT_AVAILABLE = True
+except ImportError as e:
+    _HPE_OBJECT_IMPORT_ERROR = str(e)
+
+    if "cuFileGetMemoryType" in str(e):
+        _HPE_OBJECT_IMPORT_ERROR = (
+            f"\n\nOriginal error: {e}"
+        )
 
 # First Party
 from lmcache.logging import init_logger
@@ -65,7 +127,7 @@ class AdhocSharedMemoryManager:
         self.shm_names = shm_names
         self.mmaps = mmaps
 
-    def allocate(self) -> tuple[str, int]:
+    def allocate(self) -> tuple[str, int, mmap.mmap]:
         """
         Allocate a shared memory buffer and return its name and a bytearray
         that can be used to access the buffer.
@@ -75,12 +137,14 @@ class AdhocSharedMemoryManager:
 
         shm = self.shm_buffers.pop()
         shm_name = self.shm_names.pop()
-        return shm_name, shm
+        mm = self.mmaps.pop()
+        return shm_name, shm, mm
 
     def free(
         self,
         shm_name: str,
         shm: int,
+        mm: mmap.mmap,
     ) -> None:
         """
         Free a shared memory buffer.
@@ -88,6 +152,7 @@ class AdhocSharedMemoryManager:
 
         self.shm_buffers.append(shm)
         self.shm_names.append(shm_name)
+        self.mmaps.append(mm)
 
     def close(self):
         # let python GC clean up mmap inodes
@@ -122,6 +187,8 @@ class S3Connector(RemoteConnector):
             raise ValueError("S3 url must start with 's3://'")
 
         self.s3_endpoint = s3_endpoint.removeprefix("s3://")
+        self.s3_bucket_name = "s3tcpbucket"
+        self.s3_rdma_endpoint = "http://cxo-s3-cluster200.lab.nimblestorage.com:8443"
         self.s3_prefix = s3_file_prefix
         self.loop = loop
         self.local_cpu_backend = local_cpu_backend
@@ -176,6 +243,12 @@ class S3Connector(RemoteConnector):
         self.inflight_sema = asyncio.Semaphore(s3_max_inflight_reqs)
         self.pq_executor = AsyncPQExecutor(loop)
 
+        self._client_pool: List[S3RdmaClient] = []
+        self._client_pool_size = 16 # Number of clients in the pool
+        self._client_iterator: Optional[cycle] = None
+        self._client_lock = asyncio.Lock()
+
+
     def post_init(self):
         logger.info("Post-initializing S3 connector")
 
@@ -214,6 +287,38 @@ class S3Connector(RemoteConnector):
             shm_names=shm_names,
             mmaps=mmaps,
         )
+
+        client_config = ClientConfig(
+            endpoint=self.s3_rdma_endpoint,
+            max_parallel_requests=16,
+        )
+
+        # if self.setings.max_segment_size is not None:
+        #     logger.info("Using max segment size: %s bytes", self.settings.max_segment_size)
+        #     client_config.max_segment_size = self.settings.max_segment_size
+
+        # Create pool of S3RdmaClient instances
+        for i in range(self._client_pool_size):
+            client = S3RdmaClient(client_config)
+            self._client_pool.append(client)
+            logger.debug(
+                "%s Created S3 RDMA client %d/%d",
+                LOG_PREFIX, i + 1, self._client_pool_size)
+
+        # Create round-robin iterator
+        self._client_iterator = cycle(self._client_pool)
+
+        logger.info(
+            "%s S3 RDMA client pool initialized with %d clients",
+            LOG_PREFIX, self._client_pool_size)
+
+    # Pick the next S3RdmaClient from the pool
+    async def _get_next_client(self) -> S3RdmaClient:
+        """Get next client from pool using round-robin scheduling."""
+        assert self._client_iterator is not None
+
+        async with self._client_lock:
+            return next(self._client_iterator)
 
     def _format_safe_path(self, key_str: str) -> str:
         """
@@ -385,7 +490,7 @@ class S3Connector(RemoteConnector):
                 return None
             self.object_size_cache[key_str] = obj_size
 
-        await self.inflight_sema.acquire()
+        #await self.inflight_sema.acquire()
 
         memory_obj = self.local_cpu_backend.allocate(
             self.meta_shape,
@@ -400,27 +505,57 @@ class S3Connector(RemoteConnector):
 
         # TODO(Jiayi): Need to support offset to enable zero-copy
         # We probably need to get the shared memory offset directly from memory object.
-        recv_path, shm = self.adhoc_shm_manager.allocate()
+        recv_path, shm, mm = self.adhoc_shm_manager.allocate()
+        src_view = memoryview(mm)
 
-        start_perf = time.perf_counter_ns()
-        s3_req = self._s3_download(
-            key_str=key_str,
-            recv_path=recv_path,
+        #start_perf = time.perf_counter_ns()
+        # s3_req = self._s3_download(
+        #     key_str=key_str,
+        #     recv_path=recv_path,
+        # )
+        # await asyncio.wrap_future(s3_req.finished_future)
+        #next_client = await self._get_next_client()
+        #assert next_client is not None
+
+        # Lockless client selection using consistent hashing
+        next_client = self._client_pool[hash(key_str) % self._client_pool_size]
+
+        # The keys are stored with '/' replaced by '_'
+        # We'll need the same format while retrieving
+        flat_key_str = key_str.replace("/", "_")
+
+        buffer_get_object_instance = BufferGetObject(
+            bucket=self.s3_bucket_name,
+            key=flat_key_str,
+            buffer=src_view
         )
-        await asyncio.wrap_future(s3_req.finished_future)
+
+        # Wrap synchronous RDMA call in executor to properly await it
+        await self.loop.run_in_executor(
+            None,
+            next_client.get_object_buffers,
+            buffer_get_object_instance
+        )
 
         dst_ptr = memory_obj.data_ptr
-        ctypes.memmove(dst_ptr, shm, obj_size)
 
-        end_perf = time.perf_counter_ns()
-        perf_duration = end_perf - start_perf
-        logger.info(
-            "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
-            LOG_PREFIX, perf_duration / 1_000_000, key_str, obj_size)
+        # Cast the memoryview into a ctypes array type (e.g., an array of bytes)
+        # This makes it compatible with ctypes' internal pointer logic
+        c_source_buffer = (ctypes.c_ubyte * obj_size).from_buffer(src_view)
 
-        self.adhoc_shm_manager.free(recv_path, shm)
+        # Get the address of that ctypes buffer object
+        source_address = ctypes.addressof(c_source_buffer)
+        ctypes.memmove(dst_ptr, source_address, obj_size)
 
-        self.inflight_sema.release()
+        #end_perf = time.perf_counter_ns()
+        #perf_duration = end_perf - start_perf
+        # logger.info(
+        #     "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
+        #     LOG_PREFIX, perf_duration / 1_000_000, key_str, obj_size)
+
+        self.adhoc_shm_manager.free(recv_path, shm, mm)
+
+        #self.inflight_sema.release()
 
         return memory_obj
 
@@ -431,10 +566,11 @@ class S3Connector(RemoteConnector):
         obj_size: int,
         memory_obj: MemoryObj,
         shm: int,
+        mm: mmap.mmap,
         recv_path: str,
-        key_str: str,
-        start_time: int,
-        fut: asyncio.Future,
+        #key_str: str,
+        #start_time: int,
+        #fut: asyncio.Future,
     ):
         try:
             if memory_obj is None or shm is None:
@@ -443,13 +579,13 @@ class S3Connector(RemoteConnector):
             dst_ptr = memory_obj.data_ptr
             ctypes.memmove(dst_ptr, shm, obj_size)
 
-            self.adhoc_shm_manager.free(recv_path, shm)
+            self.adhoc_shm_manager.free(recv_path, shm, mm)
 
-            _end = time.perf_counter_ns()
-            _duration_ms = _end - start_time
-            logger.info(
-                "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
-                LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
+            # _end = time.perf_counter_ns()
+            # _duration_ms = _end - start_time
+            # logger.info(
+            #     "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
+            #     LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
 
         except Exception as e:
             logger.error("on_get_done failed for %s : %s", recv_path, str(e))
@@ -460,7 +596,8 @@ class S3Connector(RemoteConnector):
         self, keys: List[CacheEngineKey]
     ) -> List[Optional[MemoryObj]]:
         memory_objs: List[Optional[MemoryObj]] = []
-        futures = []
+        buffer_get_objects: List[BufferGetObject] = []
+        resources: List[tuple[str, int, mmap.mmap, memoryview]] = []
 
         # It is okay for len(keys) > self.s3_max_inflight_reqs
         # but it will be slower.
@@ -471,7 +608,7 @@ class S3Connector(RemoteConnector):
                 "This will cause slower retrieval."
             )
 
-        # TODO(Jiayi): Need some error handling in this loop.
+        # Prepare all buffer objects and allocate resources
         for key in keys:
             key_str = key.to_string()
 
@@ -485,8 +622,6 @@ class S3Connector(RemoteConnector):
                     continue
                 self.object_size_cache[key_str] = obj_size
 
-            await self.inflight_sema.acquire()
-
             memory_obj = self.local_cpu_backend.allocate(
                 self.meta_shape,
                 self.meta_dtype,
@@ -496,7 +631,6 @@ class S3Connector(RemoteConnector):
             memory_objs.append(memory_obj)
 
             if not memory_obj:
-                self.inflight_sema.release()
                 continue
 
             # TODO(Jiayi): Please support this
@@ -504,22 +638,68 @@ class S3Connector(RemoteConnector):
                 "Saving unfull chunk is not supported in S3Connector."
             )
 
-            # freeing is done in on_get_done callback
-            recv_path, shm = self.adhoc_shm_manager.allocate()
+            # Allocate shared memory buffer
+            recv_path, shm, mm = self.adhoc_shm_manager.allocate()
+            src_view = memoryview(mm)
 
-            _start = time.perf_counter_ns()
-            s3_req = self._s3_download(
-                key_str=key_str,
-                recv_path=recv_path,
-            )
-            fut = asyncio.wrap_future(s3_req.finished_future)
-            fut.add_done_callback(partial(
-                self.on_get_done, obj_size, memory_obj, shm, recv_path,
-                key_str, _start)
-            )
-            futures.append(fut)
+            # Store resources for cleanup later
+            resources.append((recv_path, shm, mm, src_view))
 
-        await asyncio.gather(*futures)
+            # The keys are stored with '/' replaced by '_'
+            flat_key_str = key_str.replace("/", "_")
+
+            buffer_get_object_instance = BufferGetObject(
+                bucket=self.s3_bucket_name,
+                key=flat_key_str,
+                buffer=src_view
+            )
+
+            buffer_get_objects.append(buffer_get_object_instance)
+
+        # Perform batched RDMA read if we have any valid objects
+        if buffer_get_objects:
+            # Select client using consistent hashing based on first key
+            next_client = self._client_pool[hash(keys[0].to_string()) % self._client_pool_size]
+
+            logger.info(
+                "%s Starting RDMA Batched GET", LOG_PREFIX)
+
+            start_perf = time.perf_counter_ns()
+            # Wrap synchronous RDMA call in executor to properly await it
+            await self.loop.run_in_executor(
+                None,
+                next_client.get_object_buffers,
+                buffer_get_objects
+            )
+            perf_duration = time.perf_counter_ns() - start_perf
+            logger.info(
+                "%s RDMA Batched GET completed in %.6f ms: %d objects.",
+                LOG_PREFIX, perf_duration / 1_000_000,
+                len(buffer_get_objects)
+            )
+
+            # Copy data from shared memory buffers to memory objects
+            resource_idx = 0
+            for i, memory_obj in enumerate(memory_objs):
+                if memory_obj is None:
+                    continue
+
+                recv_path, shm, mm, src_view = resources[resource_idx]
+                key_str = keys[i].to_string()
+                obj_size = self.object_size_cache[key_str]
+
+                dst_ptr = memory_obj.data_ptr
+
+                # Cast the memoryview into a ctypes array type
+                c_source_buffer = (ctypes.c_ubyte * obj_size).from_buffer(src_view)
+                source_address = ctypes.addressof(c_source_buffer)
+                ctypes.memmove(dst_ptr, source_address, obj_size)
+
+                # Free shared memory buffer
+                self.adhoc_shm_manager.free(recv_path, shm, mm)
+
+                resource_idx += 1
+
         return memory_objs
 
     def _s3_upload(
@@ -569,7 +749,7 @@ class S3Connector(RemoteConnector):
         )
 
         await self.inflight_sema.acquire()
-        send_path, shm = self.adhoc_shm_manager.allocate()
+        send_path, shm, mm = self.adhoc_shm_manager.allocate()
         logger.debug("Allocated shared memory for S3 upload")
 
         try:
@@ -577,12 +757,12 @@ class S3Connector(RemoteConnector):
             ctypes.memmove(shm, buffer_ptr, memory_obj.get_physical_size())
             logger.debug("Data copy to S3 buffer completed")
 
-            _start = time.perf_counter_ns()
+            # _start = time.perf_counter_ns()
             s3_req = self._s3_upload(key_str, send_path)
             await asyncio.wrap_future(s3_req.finished_future)
-            _end = time.perf_counter_ns()
-            _duration_ms = (_end - _start)
-            logger.info("%s TCP PUT completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, memory_obj.get_physical_size())
+            # _end = time.perf_counter_ns()
+            # _duration_ms = (_end - _start)
+            # logger.info("%s TCP PUT completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, memory_obj.get_physical_size())
 
             self.object_size_cache[key_str] = memory_obj.get_physical_size()
             logger.debug(f"Uploaded {key_str} to S3 successfully")
@@ -591,7 +771,7 @@ class S3Connector(RemoteConnector):
             raise
         finally:
             self.inflight_sema.release()
-            self.adhoc_shm_manager.free(send_path, shm)
+            self.adhoc_shm_manager.free(send_path, shm, mm)
 
     async def put(self, key: CacheEngineKey, memory_obj: MemoryObj):
         return await self.pq_executor.submit_job(
