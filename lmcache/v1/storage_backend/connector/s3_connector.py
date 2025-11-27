@@ -402,7 +402,7 @@ class S3Connector(RemoteConnector):
         # We probably need to get the shared memory offset directly from memory object.
         recv_path, shm = self.adhoc_shm_manager.allocate()
 
-        start_perf = time.perf_counter_ns()
+        # start_perf = time.perf_counter_ns()
         s3_req = self._s3_download(
             key_str=key_str,
             recv_path=recv_path,
@@ -412,11 +412,11 @@ class S3Connector(RemoteConnector):
         dst_ptr = memory_obj.data_ptr
         ctypes.memmove(dst_ptr, shm, obj_size)
 
-        end_perf = time.perf_counter_ns()
-        perf_duration = end_perf - start_perf
-        logger.info(
-            "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
-            LOG_PREFIX, perf_duration / 1_000_000, key_str, obj_size)
+        # end_perf = time.perf_counter_ns()
+        # perf_duration = end_perf - start_perf
+        # logger.info(
+            # "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
+            # LOG_PREFIX, perf_duration / 1_000_000, key_str, obj_size)
 
         self.adhoc_shm_manager.free(recv_path, shm)
 
@@ -445,11 +445,11 @@ class S3Connector(RemoteConnector):
 
             self.adhoc_shm_manager.free(recv_path, shm)
 
-            _end = time.perf_counter_ns()
-            _duration_ms = _end - start_time
-            logger.info(
-                "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
-                LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
+            # _end = time.perf_counter_ns()
+            # _duration_ms = _end - start_time
+            # logger.info(
+                # "%s TCP GET completed in %.6f ms: %s. Transfer size: %s",
+                # LOG_PREFIX, _duration_ms / 1_000_000, key_str, obj_size)
 
         except Exception as e:
             logger.error("on_get_done failed for %s : %s", recv_path, str(e))
@@ -507,7 +507,7 @@ class S3Connector(RemoteConnector):
             # freeing is done in on_get_done callback
             recv_path, shm = self.adhoc_shm_manager.allocate()
 
-            _start = time.perf_counter_ns()
+            # _start = time.perf_counter_ns()
             s3_req = self._s3_download(
                 key_str=key_str,
                 recv_path=recv_path,
@@ -577,12 +577,14 @@ class S3Connector(RemoteConnector):
             ctypes.memmove(shm, buffer_ptr, memory_obj.get_physical_size())
             logger.debug("Data copy to S3 buffer completed")
 
-            _start = time.perf_counter_ns()
+            # _start = time.perf_counter_ns()
+
             s3_req = self._s3_upload(key_str, send_path)
             await asyncio.wrap_future(s3_req.finished_future)
-            _end = time.perf_counter_ns()
-            _duration_ms = (_end - _start)
-            logger.info("%s TCP PUT completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, memory_obj.get_physical_size())
+
+            # _end = time.perf_counter_ns()
+            # _duration_ms = (_end - _start)
+            # logger.info("%s TCP PUT completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, memory_obj.get_physical_size())
 
             self.object_size_cache[key_str] = memory_obj.get_physical_size()
             logger.debug(f"Uploaded {key_str} to S3 successfully")
