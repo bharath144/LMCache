@@ -261,8 +261,9 @@ class S3RdmaConnector(RemoteConnector):
         )
 
         if self.settings.max_segment_size is not None:
-            logger.info("Using max segment size: %s bytes",
-                        self.settings.max_segment_size)
+            logger.info(
+                "Using max segment size: %s bytes",
+                self.settings.max_segment_size)
             client_config.max_segment_size = self.settings.max_segment_size
 
         # Create pool of S3RdmaClient instances
@@ -656,8 +657,8 @@ class S3RdmaConnector(RemoteConnector):
         for key, memory_obj in zip(keys_list, memory_objs):
             self.object_size_cache[key] = len(memory_obj.byte_array)
 
-    def support_batched_async_contains(self) -> bool:
-        return False
+    # def support_batched_async_contains(self) -> bool:
+        # return False
 
     def support_batched_get_non_blocking(self) -> bool:
         return False
