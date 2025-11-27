@@ -10,11 +10,8 @@ import ctypes
 import mmap
 import os
 import tempfile
-import time
+#import time
 from enum import IntEnum, auto
-
-# Third Party
-import torch
 
 # CRITICAL: Must load HPE's cuFile library BEFORE any code imports hpe_object
 # This must happen at module import time, not later
@@ -569,14 +566,18 @@ class S3RdmaConnector(RemoteConnector):
             buffer_view = memory_obj.byte_array
             client = self.client_pool[hash(s3_key) % self.client_pool_size]
 
+            put_buffer = BufferPutObject(
+                bucket=self.settings.bucket,
+                key=s3_key,
+                buffer=buffer_view)
+
             # start_perf = time.perf_counter_ns()
-            client.put_object_buffers(
-                BufferPutObject(
-                    bucket=self.settings.bucket,
-                    key=s3_key,
-                    buffer=buffer_view
-                )
+            await self.loop.run_in_executor(
+                None,
+                client.put_object_buffers,
+                put_buffer
             )
+
             # end_perf = time.perf_counter_ns()
             # perf_duration = end_perf - start_perf
             # logger.info(
@@ -631,7 +632,11 @@ class S3RdmaConnector(RemoteConnector):
 
             # start_perf = time.perf_counter_ns()
 
-            client.put_object_buffers(buffer_objects)
+            await self.loop.run_in_executor(
+                None,
+                client.put_object_buffers,
+                buffer_objects
+            )
 
             # end_perf = time.perf_counter_ns()
             # perf_duration = end_perf - start_perf
