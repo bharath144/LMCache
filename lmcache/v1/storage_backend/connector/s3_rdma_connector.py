@@ -12,6 +12,13 @@ import os
 import tempfile
 #import time
 from enum import IntEnum, auto
+from urllib.parse import quote as url_quote
+
+
+# Third Party (AWS CRT TCP client for baseline PUT path)
+from awscrt import auth, io, s3
+from awscrt.http import HttpHeaders, HttpRequest
+from awscrt.io import ClientTlsContext, TlsConnectionOptions, TlsContextOptions
 
 # CRITICAL: Must load HPE's cuFile library BEFORE any code imports hpe_object
 # This must happen at module import time, not later
@@ -204,6 +211,7 @@ class S3RdmaConnector(RemoteConnector):
         self._boto_client = None
         self.object_size_cache: Dict[str, int] = {}
         self.pq_executor: Optional[AsyncPQExecutor] = None
+        self.inflight_sema = asyncio.Semaphore(64)
 
         self._prefixed_bucket_path = settings.prefix
         self._effective_parallelism = max(1, settings.max_parallel_requests)
@@ -212,6 +220,9 @@ class S3RdmaConnector(RemoteConnector):
         self.client_pool_size = 16 # Number of clients in the pool
 
         self.adhoc_shm_manager: Optional[AdhocSharedMemoryManager] = None
+
+        self.credentials_provider = None
+        self.tcp_s3_client = None
 
     def post_init(self) -> None:
         """Initialize clients after event loop is set up."""
@@ -280,6 +291,31 @@ class S3RdmaConnector(RemoteConnector):
 
         self.pq_executor = AsyncPQExecutor(self.loop)
         logger.info("S3 RDMA connector initialization complete")
+
+        # Minimal AWS CRT S3 client init (TCP path) for PUT baseline comparison
+        event_loop_group = io.EventLoopGroup(self._effective_parallelism)
+        host_resolver = io.DefaultHostResolver(event_loop_group)
+        client_bootstrap = io.ClientBootstrap(event_loop_group, host_resolver)
+        self.credentials_provider = \
+            auth.AwsCredentialsProvider.new_default_chain(client_bootstrap)
+
+        tls_opts = None
+        try:
+            tls_ctx = ClientTlsContext(TlsContextOptions())
+            tls_opts = TlsConnectionOptions(tls_ctx)
+            tls_opts.set_alpn_list(["h2", "http/1.1"])  # best effort, ignore failures
+        except Exception:
+            tls_opts = None
+
+        logger.info("Initializing AWS CRT S3 TCP client for baseline PUT path")
+        self.tcp_s3_client = s3.S3Client(
+            bootstrap=client_bootstrap,
+            region="us-east-1",
+            credential_provider=self.credentials_provider,
+            enable_s3express=False,
+            tls_connection_options=tls_opts,
+            tls_mode=s3.S3RequestTlsMode.DISABLED,  # non-AWS or custom endpoints
+        )
 
     def _make_s3_key(self, key: CacheEngineKey) -> str:
         """Convert CacheEngineKey to S3 object key with optional prefix."""
@@ -558,44 +594,77 @@ class S3RdmaConnector(RemoteConnector):
             priority=Priorities.PUT,
         )
 
-    # Fire and forget version of _put()
-    async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
-        """Internal put implementation"""
+    async def _put(self, key: CacheEngineKey, memory_obj: MemoryObj):
+        """Internal put implementation, uses TCP"""
+
         s3_key = self._make_s3_key(key)
 
+        await self.inflight_sema.acquire()
+        send_path, shm, mm = self.adhoc_shm_manager.allocate()
+        logger.debug("Allocated shared memory for S3 upload")
+
         try:
-            buffer_view = memory_obj.byte_array
-            client = self.client_pool[hash(s3_key) % self.client_pool_size]
+            buffer_ptr = memory_obj.data_ptr
+            ctypes.memmove(shm, buffer_ptr, memory_obj.get_physical_size())
+            logger.debug("Data copy to S3 buffer completed")
 
-            put_buffer = BufferPutObject(
-                bucket=self.settings.bucket,
-                key=s3_key,
-                buffer=buffer_view)
+            # _start = time.perf_counter_ns()
 
-            # start_perf = time.perf_counter_ns()
-            await self.loop.run_in_executor(
-                None,
-                client.put_object_buffers,
-                put_buffer
-            )
+            req = self._s3_tcp_upload(s3_key, send_path)
+            await asyncio.wrap_future(req.finished_future)
 
-            # end_perf = time.perf_counter_ns()
-            # perf_duration = end_perf - start_perf
-            # logger.info(
-            #     "%s RDMA PUT completed in %.6f ms: %s. Transfer size: %s",
-            #     LOG_PREFIX, perf_duration / 1_000_000,
-            #     s3_key,
-            #     len(buffer_view))
+            # _end = time.perf_counter_ns()
+            # _duration_ms = (_end - _start)
+            # logger.info("%s TCP PUT completed in %.6f ms: %s. Transfer size: %s", LOG_PREFIX, _duration_ms / 1_000_000, key_str, memory_obj.get_physical_size())
 
-            # Cache the size
-            self.object_size_cache[s3_key] = len(buffer_view)
-
-        except RuntimeError as e:
-            logger.error("RDMA PUT error for %s: %s", s3_key, e)
-            raise
+            self.object_size_cache[s3_key] = memory_obj.get_physical_size()
         except Exception as e:
-            logger.error("Unexpected error during RDMA PUT %s: %s", s3_key, e)
+            logger.error("Failed to upload %s to S3: %s", s3_key, str(e))
             raise
+        finally:
+            self.inflight_sema.release()
+            self.adhoc_shm_manager.free(send_path, shm, mm)
+
+    def _format_safe_path(self, s3_key: str) -> str:
+        """Create a URL-safe path segment for the CRT client."""
+        # Keep the key as-is to preserve '/' in object names
+        path = f"/{s3_key}"
+        return url_quote(path, safe="/")
+
+    def _s3_tcp_upload(
+        self, key_str: str, send_path: str,
+    ):
+        """Issue a blocking PUT using AWS CRT similar to S3Connector."""
+        headers = HttpHeaders()
+
+        # Construct TCP endpoint: bucket.host:port from http://host:port
+        endpoint_stripped = self.settings.endpoint.replace(
+            "http://", "").replace("https://", "")
+        tcp_endpoint = f"{self.settings.bucket}.{endpoint_stripped}"
+
+        headers.add("Host", tcp_endpoint)
+        req = HttpRequest("PUT", self._format_safe_path(key_str), headers)
+
+        done = {"err": None, "status": None}
+
+        def on_done(error=None, status_code=None, **kwargs):
+            done["err"] = error
+            done["status"] = status_code
+            if done["err"] or done["status"] not in (200, 201):
+                raise RuntimeError(
+                    f"Upload failed in S3RdmaConnector TCP path: {done}")
+
+        req = s3.S3Request(
+            client=self.tcp_s3_client,
+            type=s3.S3RequestType.PUT_OBJECT,
+            request=req,
+            operation_name="PutObject",
+            send_filepath=send_path,
+            credential_provider=self.credentials_provider,
+            region="us-east-1",
+            on_done=on_done,
+        )
+        return req
 
     async def batched_put(
         self, keys: List[CacheEngineKey], memory_objs: List[MemoryObj]
@@ -674,7 +743,7 @@ class S3RdmaConnector(RemoteConnector):
         return True
 
     def support_batched_put(self) -> bool:
-        return True
+        return False
 
     async def close(self) -> None:
         """Clean up resources."""
